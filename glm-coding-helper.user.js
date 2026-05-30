@@ -1,0 +1,2166 @@
+// ==UserScript==
+// @name         智谱 GLM Coding Plan 抢购助手 + 本地 OCR 自动验证码
+// @namespace    http://tampermonkey.net/
+// @version      8.13
+// @description  GLM Coding Rush / 智谱 GLM Coding Plan 抢购助手，一键抢购油猴脚本 / Tampermonkey userscript，配合本地 CPU/GPU OCR 自动识别中文点选验证码并点击，支持多窗口并发、限流重试和支付页安全保护
+// @author       mumumi
+// @include      https://*bigmodel.cn/glm-coding*
+// @match        https://bigmodel.cn/glm-coding*
+// @match        https://www.bigmodel.cn/glm-coding*
+// @match        https://*.gtimg.com/*
+// @match        https://*.captcha.qcloud.com/*
+// @include      https://*bigmodel.cn/html/rate-limit.html*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=bigmodel.cn
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_openInTab
+// @grant        GM_xmlhttpRequest
+// @connect      localhost:8888
+// @connect      localhost
+// @connect      127.0.0.1:8888
+// @connect      127.0.0.1
+// @connect      gtimg.com
+// @connect      *.gtimg.com
+// @connect      captcha.qcloud.com
+// @connect      *.captcha.qcloud.com
+// @connect      turing.captcha.qcloud.com
+// @run-at       document-start
+// @license      GNU GPLv3
+// @source       https://greasyfork.org/zh-CN/scripts/572157-glm-coding-plan%E6%8A%A2%E8%B4%AD%E5%8A%A9%E6%89%8B
+// @credit       Based on mumumi's GLM Coding Plan helper; thanks to the original author.
+// ==/UserScript==
+ ;
+
+// ── Shared Utilities ───────────────────────────────────────────────────────
+function visible(el) {
+    if (!el) return false;
+    var style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    var rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function bgUrlFrom(el) {
+    if (!el) return "";
+    var bg = "";
+    try { bg = (el.style && el.style.backgroundImage) || window.getComputedStyle(el).backgroundImage || ""; } catch(e) {}
+    var match = bg.match(/url\(["']?([^"')]+)/);
+    if (!match) return "";
+    try { return new URL(match[1], location.href).href; } catch(e) { return match[1]; }
+}
+function captchaBgUrlFrom(el) { return bgUrlFrom(el); }
+function fetchImageDataUrl(url) {
+    return new Promise(function(resolve, reject) {
+        if (typeof GM_xmlhttpRequest !== "undefined") {
+            GM_xmlhttpRequest({
+                method: "GET", url: url,
+                responseType: "blob",
+                onload: function(r) {
+                    var reader = new FileReader();
+                    reader.onload = function() { resolve(reader.result); };
+                    reader.onerror = function() { reject(new Error("FileReader failed")); };
+                    reader.readAsDataURL(r.response);
+                },
+                onerror: function() { reject(new Error("image download failed")); }
+            });
+            return;
+        }
+        fetch(url, { credentials: "include" })
+            .then(function(r) { return r.blob(); })
+            .then(function(blob) {
+                var reader = new FileReader();
+                reader.onload = function() { resolve(reader.result); };
+                reader.onerror = function() { reject(new Error("FileReader failed")); };
+                reader.readAsDataURL(blob);
+            })
+            .catch(reject);
+    });
+}
+function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
+
+(function () {
+    'use strict';
+
+    const __glmHost = (() => { try { return location.hostname || ''; } catch { return ''; } })();
+    const __inTencentCaptchaFrame = __glmHost.includes('gtimg.com') || __glmHost.includes('captcha.qcloud.com');
+    if (__inTencentCaptchaFrame) {
+        initTencentCaptchaDirectBridge();
+        return;
+    }
+
+    function initTencentCaptchaDirectBridge() {
+        const DIRECT_OCR_URL = 'http://127.0.0.1:8888/captcha_direct';
+        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        let solving = false;
+        let lastBgUrl = '';
+        const captchaCfg = (() => {
+            try {
+                const raw = GM_getValue('glm_coding_config_v5', '{}');
+                return { AUTO_CAPTCHA_CLICK: true, AUTO_CAPTCHA_CONFIRM: false, ...JSON.parse(raw || '{}') };
+            } catch {
+                return { AUTO_CAPTCHA_CLICK: true, AUTO_CAPTCHA_CONFIRM: false };
+            }
+        })();
+
+        function log(msg) {
+            console.log('[glm-captcha-direct] ' + msg);
+        }
+
+        function postDirect(dataUrl, chars) {
+            const body = JSON.stringify({
+                image: dataUrl,
+                text: chars,
+                ts: Date.now(),
+                source: 'tencent_iframe_direct',
+            });
+            return new Promise((resolve, reject) => {
+                if (typeof GM_xmlhttpRequest !== 'undefined') {
+                    GM_xmlhttpRequest({
+                        method: 'POST',
+                        url: DIRECT_OCR_URL,
+                        headers: { 'Content-Type': 'application/json' },
+                        data: body,
+                        onload: (res) => {
+                            try { resolve(JSON.parse(res.responseText)); }
+                            catch { reject(new Error('bad direct OCR JSON')); }
+                        },
+                        onerror: () => {
+                            fetch(DIRECT_OCR_URL, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body,
+                            }).then(r => r.json()).then(resolve).catch(reject);
+                        },
+                    });
+                    return;
+                }
+                fetch(DIRECT_OCR_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body,
+                }).then(r => r.json()).then(resolve).catch(reject);
+            });
+        }
+
+        function dispatchClick(el, nx, ny, label) {
+            const rect = el.getBoundingClientRect();
+            const win = el.ownerDocument.defaultView || window;
+            const clientX = rect.left + nx * rect.width;
+            const clientY = rect.top + ny * rect.height;
+            const base = { bubbles: true, cancelable: true, view: win, clientX, clientY, button: 0, buttons: 1 };
+            const pointer = { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: 0.5 };
+            try { if (win.PointerEvent) el.dispatchEvent(new win.PointerEvent('pointerdown', pointer)); } catch {}
+            el.dispatchEvent(new win.MouseEvent('mousedown', base));
+            try { if (win.PointerEvent) el.dispatchEvent(new win.PointerEvent('pointerup', pointer)); } catch {}
+            el.dispatchEvent(new win.MouseEvent('mouseup', base));
+            el.dispatchEvent(new win.MouseEvent('click', base));
+            log('clicked ' + (label || '') + ' @ ' + nx.toFixed(3) + ',' + ny.toFixed(3));
+        }
+
+        function clickConfirm() {
+            const selectors = [
+                '.verify-btn',
+                '.tencent-captcha-dy__verify-confirm-btn',
+                '.tencent-captcha-dy__btn-confirm',
+                '.tencent-captcha-dy__footer .btn',
+            ];
+            for (const selector of selectors) {
+                const btn = document.querySelector(selector);
+                if (visible(btn)) {
+                    btn.click();
+                    log('confirm clicked: ' + selector);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function hasError() {
+            const note = document.querySelector('#tcaptcha_note, .tencent-captcha-dy__verify-error-text');
+            return visible(note);
+        }
+
+        async function solveOnce() {
+            var autoClick = captchaCfg.AUTO_CAPTCHA_CLICK;
+            var autoConfirm = captchaCfg.AUTO_CAPTCHA_CONFIRM;
+            if (!autoClick) return;
+            const bgEl = findBgElement();
+            if (!bgEl) return;
+            const bgUrl = bgUrlFrom(bgEl);
+            if (!bgUrl || bgUrl === lastBgUrl) return;
+            const chars = findPromptText();
+            if (chars.length < 3) return;
+            if (hasError()) {
+                const reload = document.querySelector('#reload, .tencent-captcha-dy__footer-icon--refresh img');
+                if (reload) reload.click();
+                lastBgUrl = '';
+                return;
+            }
+
+            lastBgUrl = bgUrl;
+            log('capture ' + chars + ' from ' + bgUrl.slice(0, 90));
+            const dataUrl = await fetchImageDataUrl(bgUrl);
+            const response = await postDirect(dataUrl, chars);
+            const result = response && response.result;
+            if (!result || !result.success || !Array.isArray(result.click_coords)) {
+                log('direct OCR failed: ' + JSON.stringify(response).slice(0, 200));
+                return;
+            }
+
+            for (const point of result.click_coords) {
+                const nx = Number(point.nx);
+                const ny = Number(point.ny);
+                if (!Number.isFinite(nx) || !Number.isFinite(ny)) continue;
+                dispatchClick(bgEl, nx, ny, point.char || '');
+                await sleep(180);
+            }
+            await sleep(250);
+            if (autoConfirm) clickConfirm();
+        }
+
+        async function tick() {
+            if (solving) return;
+            solving = true;
+            try { await solveOnce(); }
+            catch (e) {
+                log('error: ' + e.message);
+                lastBgUrl = '';
+            } finally {
+                solving = false;
+            }
+        }
+
+        log('started on ' + location.hostname);
+        const observer = new MutationObserver(() => setTimeout(tick, 80));
+        const root = document.body || document.documentElement;
+        observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
+        setTimeout(tick, 500);
+        setInterval(tick, 1200);
+    }
+ 
+    // ── 去重保护：防止篡猴里装了改名导致的两个实例同时运行 ──────────────────
+    if (document.documentElement.dataset.glmHelper === '1') { return; }
+    document.documentElement.dataset.glmHelper = '1';
+ 
+    // ── 最早读配置（document-start 时还没有主流程）──────────────────────────
+    const EARLY_STORAGE_KEY = 'glm_coding_config_v5';
+    const SAFE_DEFAULTS_VERSION = 2;
+    const _ec = (() => { try { return JSON.parse(GM_getValue(EARLY_STORAGE_KEY, '{}')); } catch { return {}; } })();
+    if (_ec.SAFE_DEFAULTS_VERSION !== SAFE_DEFAULTS_VERSION) {
+        _ec.AUTO_CLOSE_INVALID = false;
+        _ec.SAFE_DEFAULTS_VERSION = SAFE_DEFAULTS_VERSION;
+        GM_setValue(EARLY_STORAGE_KEY, JSON.stringify(_ec));
+    }
+    const EARLY_AUTO_CLOSE_INVALID = _ec.AUTO_CLOSE_INVALID === true;
+
+    const GLM_DISCOUNT_CODE = ['9G', 'XW', 'L9', 'KC', 'GZ'].join('');
+    const GLM_CODING_URL = () => `https://www.bigmodel.cn/glm-coding?ic=${GLM_DISCOUNT_CODE}&closedialog=true`;
+ 
+    // ── 限流页立即跳回主页 ────────────────────────────────────────────────────
+    if (location.href.includes('rate-limit.html') && EARLY_AUTO_CLOSE_INVALID) {
+        location.replace(GLM_CODING_URL());
+        return;
+    }
+    if (location.href.includes('rate-limit.html')) {
+        window.addEventListener('DOMContentLoaded', () => {
+            const notice = document.createElement('div');
+            notice.textContent = 'GLM Coding Helper: auto-close is disabled. Handle this rate-limit page manually, or enable auto-close in the helper config.';
+            notice.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;padding:10px 16px;background:#d46b08;color:#fff;font:14px/1.5 system-ui,sans-serif';
+            document.body.appendChild(notice);
+        });
+        return;
+    }
+ 
+    // ── v8.0: 无条件激活售罄按钮 - JSON.parse 劫持 ──────────────────────────
+    const _oP = JSON.parse;
+    JSON.parse = function (t, r) {
+        const o = _oP(t, r);
+        try { (function f(x) {
+            if (!x || typeof x !== 'object') return;
+            if ('isSoldOut' in x && x.isSoldOut === true) x.isSoldOut = false;
+            if ('soldOut'   in x && x.soldOut   === true) x.soldOut   = false;
+            if ('disabled'  in x && x.disabled  === true && (x.price !== undefined || x.productId || x.title)) x.disabled = false;
+            if ('stock'     in x && x.stock     === 0) x.stock = 999;
+            for (const k in x) f(x[k]);
+        })(o); } catch {}
+        return o;
+    };
+ 
+    // ── 购买状态（fetch 拦截器 ↔ UI 主循环共享）─────────────────────────────
+    const PS = {
+        inProgress : false,
+        result     : null,      // null | 'success' | 'sold_out' | 'busy' | 'error'
+        bizId      : null,
+        payAmount  : null,
+        rawCode    : null,      // v8.9: 记录原始错误码(555/500等)
+    };
+    let everSucceeded = false;  // v8.9: 一旦拿到过有效 bizId，永不关闭弹窗
+ 
+    // ── fetch 拦截（/api/biz/pay/preview 和 check）──────────────────────────
+    const _oF = window.fetch;
+ 
+    // v8.0: 从 Cookie 提取 token 和从页面提取组织/项目信息
+    function getAuthHeaders() {
+        const token = document.cookie.match(/bigmodel_token_production=([^;]+)/)?.[1] || '';
+        const headers = {
+            'authorization': token,
+            'content-type': 'application/json;charset=UTF-8',
+            'accept': 'application/json, text/plain, */*',
+            'accept-language': 'zh',
+            'set-language': 'zh'
+        };
+ 
+        // 尝试从 localStorage 获取组织和项目 ID
+        try {
+            const orgId = localStorage.getItem('bigmodel_organization') || '';
+            const projId = localStorage.getItem('bigmodel_project') || '';
+            headers['bigmodel-organization'] = orgId;
+            headers['bigmodel-project'] = projId;
+        } catch {}
+ 
+        return headers;
+    }
+ 
+    window.fetch = async function (...a) {
+        const url = (typeof a[0] === 'string' ? a[0] : a[0]?.url) || '';
+ 
+        // 拦截 preview：只发一次，不重试（验证码只能用一次）
+        if (url.includes('/api/biz/pay/preview')) {
+            PS.inProgress = true;
+            PS.result     = null;
+            PS.bizId      = null;
+            PS.payAmount  = null;
+ 
+            // 提取原始 body
+            const [urlOrReq, init = {}] = a;
+            let body = init.body;
+            if (!body && urlOrReq instanceof Request) {
+                body = await urlOrReq.clone().text();
+            }
+ 
+            const authHeaders = getAuthHeaders();
+ 
+            try {
+                const r = await _oF(url, {
+                    method: 'POST',
+                    headers: authHeaders,
+                    body: body,
+                    credentials: 'include'
+                });
+                const txt = await r.text();
+                let d;
+                try { d = _oP(txt); } catch { d = {}; }
+ 
+                console.log('[GLM v8.0 DEBUG] preview响应:', d);
+                console.log('[GLM v8.0 DEBUG] soldOut值:', d?.data?.soldOut, '类型:', typeof d?.data?.soldOut);
+ 
+                if (d?.code === 200 && d?.data?.bizId) {
+                    PS.result    = 'success';
+                    PS.bizId     = d.data.bizId;
+                    PS.payAmount = d.data.payAmount;
+                    PS.inProgress = false;
+                    everSucceeded = true;
+                    mtNotifyClick();
+                    return new Response(txt, { status: 200, headers: { 'Content-Type': 'application/json' } });
+                } else if (d?.code === 555 || (d?.code >= 500 && d?.code !== 200)) {
+                    console.log(`[GLM v8.9] preview 错误 code:${d?.code} msg:${d?.msg}，脚本将自动重试`);
+                    PS.result = 'busy';
+                    PS.rawCode = d?.code;
+                    PS.inProgress = false;
+                    return new Response(
+                        JSON.stringify({ code: 500, msg: '系统繁忙，脚本自动重试中', data: null, success: false }),
+                        { status: 200, headers: { 'Content-Type': 'application/json' } }
+                    );
+                } else if (d?.code === 200 && d?.data?.soldOut === true) {
+                    console.log('[GLM v8.9] preview返回200+soldOut，原样透传，脚本记录sold_out');
+                    PS.result = 'sold_out';
+                    PS.inProgress = false;
+                    return new Response(txt, { status: r.status, headers: { 'Content-Type': 'application/json' } });
+                } else {
+                    console.log('[GLM v8.9] preview 非预期错误 code:', d?.code, 'msg:', d?.msg, '→ 标记busy');
+                    PS.result = 'busy';
+                    PS.rawCode = d?.code;
+                    PS.inProgress = false;
+                    return new Response(txt, { status: r.status, headers: { 'Content-Type': 'application/json' } });
+                }
+            } catch (e) {
+                PS.result = 'error';
+                PS.inProgress = false;
+                throw e;
+            }
+        }
+ 
+        // 拦截 check：如果 bizId 为 null，直接返回失败
+        if (url.includes('/api/biz/pay/check')) {
+            if (url.includes('bizId=null') || !PS.bizId) {
+                return new Response(
+                    '{"code":500,"msg":"无效的 bizId","data":null,"success":false}',
+                    { status: 200, headers: { 'Content-Type': 'application/json' } }
+                );
+            }
+        }
+ 
+        const res = await _oF.apply(this, a);
+        const rCt = res.headers.get('content-type') || '';
+        if (rCt.includes('json') && (url.includes('/api/') || url.includes('bigmodel'))) {
+            try {
+                const txt = await res.clone().text();
+                const mod = txt
+                    .replace(/"isSoldOut"\s*:\s*true/g, '"isSoldOut":false')
+                    .replace(/"soldOut"\s*:\s*true/g, '"soldOut":false')
+                    .replace(/"stock"\s*:\s*0/g, '"stock":999')
+                    .replace(/"disabled"\s*:\s*true/g, '"disabled":false')
+                    .replace(/"available"\s*:\s*false/g, '"available":true')
+                    .replace(/"purchasable"\s*:\s*false/g, '"purchasable":true');
+                if (mod !== txt) console.log('[GLM v8.4] API响应已修改:', url.slice(0, 80));
+                return new Response(mod, { status: res.status, statusText: res.statusText, headers: res.headers });
+            } catch (e) { return res; }
+        }
+        return res;
+    };
+
+    // XHR 兜底（重定向到上方 fetch 拦截器）
+    const _xO = XMLHttpRequest.prototype.open;
+    const _xS = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u, ...r) { this._u = u; this._m = m; return _xO.call(this, m, u, ...r); };
+    XMLHttpRequest.prototype.send = function (...a) {
+        if ((this._u || '').includes('/api/biz/pay/preview')) {
+            const self = this;
+            window.fetch(this._u, { method: this._m || 'POST', body: a[0], credentials: 'include' }).then(async r => {
+                const txt = await r.text();
+                const dp = (k, v) => Object.defineProperty(self, k, { value: v, configurable: true });
+                dp('readyState', 4); dp('status', 200); dp('statusText', 'OK');
+                dp('responseText', txt); dp('response', txt);
+                const ev = new Event('readystatechange');
+                if (typeof self.onreadystatechange === 'function') self.onreadystatechange(ev);
+                self.dispatchEvent(ev);
+                ['load', 'loadend'].forEach(t => {
+                    const e = new ProgressEvent(t);
+                    if (typeof self[`on${t}`] === 'function') self[`on${t}`](e);
+                    self.dispatchEvent(e);
+                });
+            });
+            return;
+        }
+        return _xS.apply(this, a);
+    };
+ 
+    // ── 每日套餐状态（localStorage，按日隔离）────────────────────────────────
+    // -1未知  0进行中(重启复位)  1今日售罄  2今日已购
+    const _today = new Date().toISOString().slice(0, 10);
+    const _dsKey = `glm_ds_${_today}`;
+    let _ds = (() => { try { return JSON.parse(localStorage.getItem(_dsKey) || '{}'); } catch { return {}; } })();
+    Object.keys(_ds).forEach(k => { if (_ds[k] === 0) _ds[k] = -1; });
+    _flush();
+    function _flush()       { localStorage.setItem(_dsKey, JSON.stringify(_ds)); }
+    function getS(t, p)     { return _ds[`${t}-${p}`] ?? -1; }
+    function setS(t, p, v)  { _ds[`${t}-${p}`] = v; _flush(); }
+ 
+    if (Object.values(_ds).includes(2)) {
+        setTimeout(() => setBar('🎉 今日已订阅成功，脚本停止。', '#237804'), 800);
+        return;
+    }
+ 
+    // ── 配置 ──────────────────────────────────────────────────────────────────
+    const STORAGE_KEY = 'glm_coding_config_v5';
+    const TABS_MAP    = { 1: '连续包月', 2: '连续包季', 3: '连续包年' };
+    const PKGS_MAP    = { 1: 'Lite',    2: 'Pro',      3: 'Max'      };
+    const DEF = {
+        TABS_PRIORITY     : '1',
+        PACKAGES_PRIORITY : '2,3,1',
+        CHECK_INTERVAL    : 80,
+        SMART_REFRESH     : true,
+        AUTO_CLOSE_INVALID: false,
+        AUTO_CLICK_SUB    : true,
+        AUTO_CAPTCHA_CLICK : true,
+        AUTO_CAPTCHA_CONFIRM: false,
+        TEST_MODE: false,
+        MT_TABS          : 1,       // 多开标签页数（1=单窗口）
+        MT_STAGGER_MS    : 500,     // 多开错开间隔（毫秒）
+    };
+ 
+    function loadCfg() { try { const s = GM_getValue(STORAGE_KEY, null); return s ? { ...DEF, ...JSON.parse(s) } : { ...DEF }; } catch { return { ...DEF }; } }
+    function saveCfg(c) { GM_setValue(STORAGE_KEY, JSON.stringify(c)); }
+    const CFG = loadCfg();
+ 
+    GM_registerMenuCommand('⚙️ 打开配置面板', openConfigPanel);
+    GM_registerMenuCommand('🗑️ 清除今日套餐状态缓存', () => { localStorage.removeItem(_dsKey); alert('今日状态已清除，即将刷新。'); location.reload(); });
+    GM_registerMenuCommand('🚀 一键多开窗口', openMultipleWindows);
+ 
+    // ── v8.0: ESC 键快速关闭弹窗 ──────────────────────────────────────────────
+    let pendingRecheck = false;
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' || e.keyCode === 27) {
+            const busyDlg = document.querySelector('.el-dialog__wrapper .empty-data-wrap');
+            if (busyDlg) {
+                const wrapper = busyDlg.closest('.el-dialog__wrapper');
+                if (wrapper && getComputedStyle(wrapper).display !== 'none') {
+                    closeModal(wrapper);
+                    console.log('[GLM] ESC 关闭系统繁忙弹窗');
+                    pendingRecheck = true; return;
+                }
+            }
+            const rlw = findRLModal();
+            if (rlw) {
+                closeModal(rlw);
+                console.log('[GLM] ESC 关闭限流弹窗');
+                pendingRecheck = true; return;
+            }
+            const payDlg = getPayDialog();
+            if (payDlg) {
+                const prices = readDialogPrices();
+                if (prices && !prices.any) {
+                    closePayDialog();
+                    console.log('[GLM] ESC 关闭无效支付弹窗（无价格）');
+                    pendingRecheck = true; return;
+                }
+                closePayDialog();
+                console.log('[GLM] ESC 关闭支付弹窗');
+                pendingRecheck = true; return;
+            }
+        } else if (e.key === 'Enter' || e.keyCode === 13 || e.key === ' ') {
+            e.preventDefault();
+            var confirmBtn = document.querySelector('.tencent-captcha-dy__verify-confirm-btn');
+            if (confirmBtn) {
+                var cr = confirmBtn.getBoundingClientRect();
+                if (cr.width > 0 && cr.height > 0) {
+                    confirmBtn.click();
+                    console.log('[GLM] ' + e.key + ' 点击验证码确认按钮');
+                    return;
+                }
+            }
+            var altBtn = document.querySelector('.tencent-captcha-dy__btn-confirm');
+            if (altBtn) {
+                var ar = altBtn.getBoundingClientRect();
+                if (ar.width > 0 && ar.height > 0) {
+                    altBtn.click();
+                    console.log('[GLM] ' + e.key + ' 点击验证码确认按钮(alt)');
+                    return;
+                }
+            }
+        }
+    });
+ 
+    // ── v8.0: 一键多开窗口函数（0.5s 异步错开）────────────────────────────────
+    function openMultipleWindows() {
+        const count = prompt('请输入要打开的窗口数量（建议 2-8 个）:', String(CFG.MT_TABS));
+        if (!count) return;
+        const n = parseInt(count);
+        if (isNaN(n) || n < 1 || n > 20) { alert('请输入 1-20 之间的数字'); return; }
+        const stagger = parseInt(CFG.MT_STAGGER_MS) || 500;
+        const baseUrl = GLM_CODING_URL();
+        for (let i = 0; i < n; i++) {
+            setTimeout(() => {
+                const sep = baseUrl.includes('?') ? '&' : '?';
+                const url = baseUrl + `${sep}wi=${i}`;
+                GM_openInTab(url, { active: false, insert: true, setParent: true });
+            }, i * Math.max(100, stagger));
+        }
+        alert(`✅ 已打开 ${n} 个标签页（间隔 ${stagger}ms 错开）！\n\n每个窗口独立运行状态机，抢到即止。`);
+    }
+ 
+    // ── 扫描队列（过滤今日已确认售罄）────────────────────────────────────────
+    const tabs      = String(CFG.TABS_PRIORITY).split(',').map(Number).filter(Boolean);
+    const pkgs      = String(CFG.PACKAGES_PRIORITY).split(',').map(Number).filter(Boolean);
+    const scanQueue = tabs.flatMap(t => pkgs.map(p => ({ tab: t, pkg: p }))).filter(({ tab: t, pkg: p }) => getS(t, p) !== 1);
+ 
+    if (!scanQueue.length) {
+        scanQueue.push({ tab: -1, pkg: -1 });
+    }
+ 
+    // ── 状态机变量 ────────────────────────────────────────────────────────────
+    let state = 'SCANNING';   // SCANNING | TASK_UNIT | SLEEPING | DONE
+ 
+    // SCANNING / TASK_UNIT
+    let qIdx = 0, sweepRestocks = [], lastTabSwitch = 0, sweepBusyCount = 0;
+    let taskTarget = null, taskPhase = 'IDLE', taskClickTime = 0, taskRLCount = 0;
+    let lastCloseReason = '';
+    let sleepUntil = 0;
+    const MAX_RL = 3, MODAL_WAIT = 15000;
+ 
+    // ── 多开协调（BroadcastChannel + GM lock）─────────────────────────────────
+    const MT_STAGGER = Math.max(100, parseInt(CFG.MT_STAGGER_MS) || 500);
+    let myWi = (() => { try { const p = new URLSearchParams(location.search); return parseInt(p.get('wi') || '0', 10); } catch { return 0; } })();
+    if (isNaN(myWi) || myWi < 0) myWi = 0;
+    let mtChannel = null;
+    let mtLockHeld = false;
+    let mtLockHolder = -1;
+    let mtLockUntil = 0;
+    let mtInitialDelay = (myWi || 0) * MT_STAGGER; // 错开初始启动
+
+    function initMT() {
+        if (myWi === 0) return;
+        try {
+            mtChannel = new BroadcastChannel('glm-mt-coord');
+            mtChannel.onmessage = (e) => {
+                const d = e.data;
+                if (!d || d.wi === myWi) return;
+                if (d.type === 'lock') {
+                    mtLockHeld = true; mtLockHolder = d.wi; mtLockUntil = Date.now() + 3000;
+                } else if (d.type === 'release' || d.type === 'clicked') {
+                    mtLockHeld = false; mtLockHolder = -1; mtLockUntil = 0;
+                }
+            };
+            mtChannel.postMessage({ type: 'hello', wi: myWi });
+            console.log(`[GLM] MT: tab #${myWi} ready (stagger ${mtInitialDelay}ms)`);
+        } catch(e) { console.log('[GLM] MT: BroadcastChannel unavailable, running standalone'); }
+    }
+    initMT();
+
+    // 异步获取点击锁（仅多开时生效）
+    function acquireMTClickLock(timeout) {
+        if (myWi === 0 || !mtChannel) return Promise.resolve(true);
+        timeout = timeout || 5000;
+        const start = Date.now();
+        return new Promise(resolve => {
+            const tryLock = () => {
+                if (Date.now() - start > timeout) { resolve(false); return; }
+                if (!mtLockHeld || Date.now() > mtLockUntil) {
+                    mtChannel.postMessage({ type: 'lock', wi: myWi, ts: Date.now() });
+                    setTimeout(() => {
+                        if (mtLockHeld && mtLockHolder === myWi) resolve(true);
+                        else setTimeout(tryLock, 200);
+                    }, 50);
+                } else {
+                    setTimeout(tryLock, 400);
+                }
+            };
+            tryLock();
+        });
+    }
+
+    function releaseMTClickLock() {
+        if (myWi === 0 || !mtChannel) return;
+        mtChannel.postMessage({ type: 'release', wi: myWi });
+        mtLockHeld = false; mtLockHolder = -1; mtLockUntil = 0;
+    }
+
+    // 通知其他窗口：本窗口已点击订阅按钮
+    function mtNotifyClick() {
+        if (myWi === 0) return;
+        GM_setValue('mt_clicked', String(Date.now()));
+        if (mtChannel) {
+            try { mtChannel.postMessage({ type: 'clicked', wi: myWi, ts: Date.now() }); } catch {}
+        }
+    }
+
+    // ── 工具函数 ──────────────────────────────────────────────────────────────
+    function parseRestock(text) {
+        const m = (text || '').match(/0?(\d{1,2})月0?(\d{1,2})日\s*(\d{1,2}):0?(\d{1,2})/);
+        if (!m) return null;
+        const t = new Date(new Date().getFullYear(), +m[1] - 1, +m[2], +m[3], +m[4]);
+        return { dateStr: `${+m[1]}月${+m[2]}日`, msUntil: t - Date.now() };
+    }
+    function todayStr() { const d = new Date(); return `${d.getMonth() + 1}月${d.getDate()}日`; }
+    function fmt(ms) {
+        if (ms <= 0) return '0秒';
+        const s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60);
+        return h ? `${h}h${m % 60}m` : m ? `${m}分${s % 60}秒` : `${s}秒`;
+    }
+    function calcSleepMs(ms) {
+        if (ms > 3600000) return 240000;
+        if (ms > 1800000) return 180000;
+        if (ms >  900000) return 120000;
+        if (ms >  300000) return  60000;
+        if (ms >  120000) return  30000;
+        if (ms >   60000) return  10000;
+        if (ms >   10000) return   3000;
+        return 0;
+    }
+    function isRealBizId(id) { return id && !id.startsWith('debug-'); }
+ 
+    // ── v8.0: 黄金时间判断（9:50-10:10）──────────────────────────────────────
+    function isGoldenTime() {
+        const now = new Date();
+        const h = now.getHours();
+        const m = now.getMinutes();
+        const time = h * 60 + m;
+        const start = 9 * 60 + 50;  // 9:50
+        const end = 10 * 60 + 10;   // 10:10
+        return time >= start && time <= end;
+    }
+ 
+    // ── DOM 访问 ──────────────────────────────────────────────────────────────
+    const tabEl     = n => document.querySelectorAll('#switchTabBox .switch-tab-item')[n - 1];
+    const btnEl     = n => document.querySelector(`.glm-coding-package-list > div:nth-child(${n}) > div > .package-card-btn-box > button`);
+    // ── 特惠订阅：通过页面上下文注入脚本绕过 TM 沙箱 ──────────────────────────
+    const subFindAndClick = (doClick, pkgIdx) => {
+        if (!document.body) return doClick ? null : {ok:0};
+        const allowed = doClick ? (pkgIdx ? '_' + pkgIdx : '') : ('_' + (CFG.PACKAGES_PRIORITY || '2,3,1'));
+        const s = document.createElement('script');
+        s.textContent = `document.__glm_sub = (function(click, allowed){
+            var only = allowed ? allowed.split('_')[1].split(',').map(function(x){return parseInt(x)}).filter(function(x){return x>0}) : null;
+            function inCard(nth){
+                for(var i=0;i<(only||[]).length;i++){ if(only[i]===nth) return true; }
+                return false;
+            }
+            var best = null;
+            // 按精确目标或优先级顺序搜索
+            var targets = only && only.length ? only : [1,2,3];
+            for(var ti=0;ti<targets.length;ti++){
+                var nth = targets[ti];
+                var card = document.querySelector('.glm-coding-package-list > div:nth-child('+nth+')');
+                if(!card) continue;
+                var btn = card.querySelector('button[name="特惠订阅"]:not([disabled]), button.buy-btn:not([disabled])');
+                if(!btn) continue;
+                var t=(btn.textContent||'')+' '+(btn.getAttribute('name')||'');
+                if(!/订阅|购买|特惠|抢购|立即|开通|限时|优惠|加入|去抢|subscribe|buy|rush/i.test(t)) continue;
+                if(/售罄|补货|暂时/.test(t)) continue;
+                if(btn.offsetParent===null||getComputedStyle(btn).display==='none') continue;
+                best = btn; break;
+            }
+            // fallback: 通用搜索 + 检查所属卡片
+            if(!best){
+                var sel = 'button,.buy-btn,.subscribe-btn,[class*="buy"],[class*="sub"],[class*="btn"]';
+                for(var els=document.querySelectorAll(sel),i=0;i<els.length;i++){
+                    var b=els[i];
+                    if(b.disabled||b.classList.contains('is-disabled')||b.classList.contains('disabled')) continue;
+                    var t=(b.textContent||'')+' '+(b.getAttribute('name')||'');
+                    if(!/订阅|购买|特惠|抢购|立即|开通|限时|优惠|加入|去抢|subscribe|buy|rush/i.test(t)) continue;
+                    if(/售罄|补货|暂时/.test(t)) continue;
+                    if(/即刻订阅|暂不订阅|了解更多/.test(t)) continue;
+                    if(b.offsetParent===null||getComputedStyle(b).display==='none') continue;
+                    var card = b.closest('.glm-coding-package-list > div');
+                    var nth = card ? Array.from(card.parentNode.children).indexOf(card)+1 : -1;
+                    if(only && !inCard(nth)) continue;
+                    best = b; break;
+                }
+            }
+            if(best){
+                console.log('[GLM] injecting click on:', best.className, (best.textContent||'').trim().slice(0,20));
+                if(click){
+                    best.scrollIntoView({behavior:'instant',block:'center'});
+                    var ts = [];
+                    [best.closest('.package-card-btn-box'), best.closest('[class*="package"]'), best.parentElement, best, best.querySelector('span')].forEach(function(el){
+                        if(el && ts.indexOf(el)===-1) ts.push(el);
+                    });
+                    ts.forEach(function(t){
+                        try{ t.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window,button:0})); }catch(e){}
+                    });
+                    console.log('[GLM] injected 点击特惠订阅 (targets='+ts.length+')');
+                }
+                return {ok:1, tag:best.tagName, text:(best.textContent||'').trim().slice(0,30), pkg:nth};
+            }
+            return {ok:0};
+        })(${doClick}, '${allowed}')`;
+        document.body.appendChild(s);
+        s.remove();
+        const r = document.__glm_sub;
+        delete document.__glm_sub;
+        return r;
+    };
+    const findOtherSubscriptionBtn = () => subFindAndClick(false);
+    const clickSubBtn2 = (pkgIdx) => subFindAndClick(true, pkgIdx);
+    const canBuy    = b => b && !b.disabled && !b.classList.contains('is-disabled') && !b.classList.contains('disabled') && !/售罄|补货|暂时/.test(b.innerText || '');
+    const isSoldOut = b => /售罄|补货|暂时/.test(b?.innerText || '');
+    const isBusy    = b => /抢购人数过多|请刷新/.test(b?.innerText || '');
+ 
+    // ── 弹窗检测 ──────────────────────────────────────────────────────────────
+    function findRLModal() {
+        for (const w of document.querySelectorAll('.el-dialog__wrapper'))
+            if (getComputedStyle(w).display !== 'none' && (w.innerText || '').includes('当前购买人数较多')) return w;
+        return null;
+    }
+    function getPayDialog() {
+        const d = document.querySelector('.pay-dialog');
+        if (d) {
+            const w = d.closest('.el-dialog__wrapper');
+            if (w && getComputedStyle(w).display !== 'none' && !(w.innerText || '').includes('当前购买人数较多')) return d;
+        }
+        for (const w of document.querySelectorAll('.el-dialog__wrapper')) {
+            if (getComputedStyle(w).display === 'none') continue;
+            const txt = w.innerText || '';
+            if (txt.includes('当前购买人数较多')) continue;
+            if (txt.includes('系统异常') || txt.includes('请稍后重试') || txt.includes('错误')) {
+                console.log('[GLM] getPayDialog found error dialog');
+                return w.querySelector('.el-dialog__body') || w.querySelector('.el-dialog') || w;
+            }
+            if (w.querySelector('.el-dialog__body img') && (txt.includes('支付') || txt.includes('支付宝') || txt.includes('微信'))) {
+                console.log('[GLM] getPayDialog fallback found payment dialog');
+                return w.querySelector('.el-dialog__body') || d;
+            }
+        }
+        return null;
+    }
+    function isPayDialog()     { return !!getPayDialog(); }
+    function isSuccessDialog() {
+        const w = document.querySelector('.pay-success-dialog-box')?.closest('.el-dialog__wrapper');
+        return w ? getComputedStyle(w).display !== 'none' : false;
+    }
+    function closeModal(w)   { w?.querySelector('.el-dialog__close')?.click(); }
+    function closePayDialog() {
+        const d = getPayDialog();
+        if (d) closeModal(d.closest('.el-dialog__wrapper'));
+    }
+
+    // ── v8.9: 小飞机检测：弹窗里出现系统繁忙的"小飞机"图标 ───────────────────
+    function hasAirplaneInDialog() {
+        const dlg = document.querySelector('.pay-dialog');
+        if (!dlg) return false;
+        return !!dlg.querySelector('.empty-data-wrap, .empty-data');
+    }
+
+    function isAirplanePayDialog(rlWrapper) {
+        if (!rlWrapper) return false;
+        return !!rlWrapper.querySelector('.pay-dialog .empty-data-wrap, .pay-dialog .empty-data');
+    }
+ 
+    // ── 对话框实付金额读取（双通道）──────────────────────────────────────────
+    //   通道A：扫码区 .info-price 最后一个 <span>（纯数字，如"149"）
+    //   通道B：计算明细区"实付金额"对应的 .price-item（含￥，如"￥149"）
+    //
+    //   两通道任一 > 0 即视为有效。
+    function readDialogPrices() {
+        const dlg = getPayDialog();
+        if (!dlg) return null;
+ 
+        // 通道A
+        let scanPrice = 0;
+        const infoPrice = dlg.querySelector('.info-price');
+        if (infoPrice) {
+            const spans = infoPrice.querySelectorAll('span');
+            // price-icon 是 ￥，后面的 span 是数值
+            for (let i = spans.length - 1; i >= 0; i--) {
+                const v = parseFloat(spans[i].textContent.trim());
+                if (!isNaN(v) && v > 0) { scanPrice = v; break; }
+            }
+        }
+ 
+        // 通道B
+        let actualPrice = 0;
+        dlg.querySelectorAll('.calculate-content-item').forEach(li => {
+            if ([...li.querySelectorAll('div')].some(d => d.textContent.includes('实付金额'))) {
+                const v = parseFloat((li.querySelector('.price-item')?.textContent || '').replace(/[￥,]/g, '').trim());
+                if (!isNaN(v) && v > 0) actualPrice = v;
+            }
+        });
+ 
+        return { scanPrice, actualPrice, any: scanPrice > 0 || actualPrice > 0 };
+    }
+ 
+    // ── v8.9: 弹窗关闭决策（三态返回）────────────────────────────────────────
+    // 返回: 'close' → 关弹窗试下一个 | 'keep' → 不关 | 'warn' → 异常，告知用户
+    function checkPayDialog() {
+        const dlg = getPayDialog();
+        if (!dlg) return 'keep';
+
+        // 绝对安全锁：本次会话中只要成功过一次，且DOM中有价格，永不关闭
+        if (everSucceeded) {
+            const prices = readDialogPrices();
+            if (prices && prices.any) return 'keep';
+            // 成功过但DOM无价格 → 无效支付（二维码缺参数），关闭
+            console.log('[GLM] everSucceeded but no prices in DOM, treating as invalid payment');
+            return 'close';
+        }
+
+        // 接口还没返回
+        if (PS.inProgress) return 'keep';
+
+        // ── 情况 A：接口 555 系统繁忙 → 关弹窗试下一个
+        if (PS.result === 'busy') return 'close';
+
+        // ── 情况 B：接口返回 200+soldOut → 关弹窗试下一个（但前端可能因 JSON.parse 劫持而正常显示了价格）
+        if (PS.result === 'sold_out') {
+            if (Date.now() - taskClickTime >= 1500) {
+                const prices = readDialogPrices();
+                if (prices?.any) {
+                    console.log('[GLM v8.9] soldOut但DOM有价格，保留弹窗（前端劫持覆盖了soldOut）');
+                    return 'keep';
+                }
+            }
+            return 'close';
+        }
+
+        // ── 情况 D：接口没说售罄/繁忙，但弹窗里出现小飞机 → 异常不一致
+        if (hasAirplaneInDialog()) return 'warn';
+
+        // ── 情况 C：接口成功 + 有价格 → 不关
+        return 'keep';
+    }
+ 
+    // ── 底部状态栏 ────────────────────────────────────────────────────────────
+    var _bar = null;
+    function setBar(html, bg = '#1677ff') {
+        if (!_bar) {
+            _bar = document.createElement('div');
+            _bar.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:2147483647;padding:7px 16px;font:13px/1.5 system-ui,sans-serif;color:#fff;display:flex;align-items:center;justify-content:space-between;box-shadow:0 -2px 8px rgba(0,0,0,.25);transition:background .4s';
+            const x = document.createElement('button');
+            x.textContent = '×';
+            x.style.cssText = 'background:rgba(255,255,255,.2);border:none;color:#fff;width:22px;height:22px;border-radius:4px;cursor:pointer;font-size:16px;line-height:1;flex-shrink:0';
+            x.onclick = () => { _bar.remove(); _bar = null; };
+            _bar.append(document.createElement('span'), x);
+            document.body.appendChild(_bar);
+        }
+        _bar.style.background = bg;
+        _bar.firstElementChild.innerHTML = `🤖 <b>抢购助手</b> #${myWi} &nbsp;|&nbsp; ${html}`;
+    }
+ 
+    // ── 支付报警：视口边框红色闪烁 ────────────────────────────────────────────
+    let _alarm = null;
+    function showPayAlarm() {
+        if (_alarm) return;
+        if (!document.getElementById('glm-alarm-s')) {
+            const s = document.createElement('style'); s.id = 'glm-alarm-s';
+            s.textContent = '@keyframes glm-al{0%,100%{box-shadow:inset 0 0 0 12px rgba(220,38,38,.92)}50%{box-shadow:inset 0 0 0 12px rgba(220,38,38,.08)}}';
+            document.head.appendChild(s);
+        }
+        _alarm = document.createElement('div');
+        _alarm.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483646;animation:glm-al .5s steps(1) infinite';
+        const lbl = document.createElement('div');
+        lbl.style.cssText = 'position:absolute;top:12px;left:50%;transform:translateX(-50%);background:rgba(220,38,38,.95);color:#fff;padding:5px 22px;border-radius:20px;font:700 15px system-ui,sans-serif;white-space:nowrap;letter-spacing:.5px';
+        lbl.textContent = '⚠️  请立即扫码支付！';
+        _alarm.appendChild(lbl);
+        document.body.appendChild(_alarm);
+    }
+ 
+    // ── 推广弹窗 ──────────────────────────────────────────────────────────────
+    function triggerPromo() {
+        const ov = document.createElement('div');
+        ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:2147483645;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(5px);font-family:system-ui,sans-serif';
+        ov.innerHTML = `
+            <div style="background:#fff;width:480px;border-radius:16px;overflow:hidden;box-shadow:0 25px 50px -12px rgba(0,0,0,.5);max-height:90vh;display:flex;flex-direction:column">
+                <div style="background:linear-gradient(135deg,#1e3c72,#2a5298);padding:24px 24px 20px;color:#fff">
+                    <h2 style="margin:0 0 6px;font-size:20px">GLM Coding Plan 全部售罄 🫠</h2>
+                    <p style="margin:0;opacity:.85;font-size:14px">配置的所有套餐今日已售罄，补货后脚本将继续监控</p>
+                </div>
+                <div style="padding:18px 20px;overflow-y:auto;flex:1;color:#333;font-size:14px;line-height:1.7">
+                    <div>脚本已停止当前轮次。你可以保持页面打开，等下一轮补货时重新启动。</div>
+                    <div style="margin-top:10px">当前使用作者内置 GLM Coding Plan 折扣入口</div>
+                </div>
+                <div style="padding:14px 20px;border-top:1px solid #f0f0f0;text-align:right">
+                    <button id="promo-x" style="background:none;border:1px solid #ddd;color:#888;padding:7px 18px;border-radius:6px;cursor:pointer;font-size:13px">关闭并停止脚本</button>
+                </div>
+            </div>`;
+        document.body.appendChild(ov);
+        ov.querySelector('#promo-x').onclick = () => ov.remove();
+        ov.onclick = e => { if (e.target === ov) ov.remove(); };
+    }
+ 
+    // ── 配置面板 ──────────────────────────────────────────────────────────────
+    function buildTransferBox(ct, dataMap, selectedStr, title) {
+        const sel   = selectedStr.split(',').filter(Boolean);
+        const avail = Object.keys(dataMap).filter(k => !sel.includes(k));
+        ct.innerHTML = `
+            <div style="font-size:13px;font-weight:bold;margin-bottom:8px;color:#444">${title}</div>
+            <div style="display:flex;align-items:stretch;gap:10px;margin-bottom:20px;height:140px">
+                <div style="flex:1;border:1px solid #ddd;border-radius:6px;display:flex;flex-direction:column;background:#fafafa">
+                    <div style="padding:6px 10px;border-bottom:1px solid #ddd;font-size:12px;color:#666;background:#f0f0f0;border-radius:6px 6px 0 0">备选池</div>
+                    <ul class="tf-left" style="list-style:none;padding:5px;margin:0;flex:1;overflow-y:auto">
+                        ${avail.map(k => `<li data-val="${k}" class="tf-item">${dataMap[k]}</li>`).join('')}
+                    </ul>
+                </div>
+                <div style="display:flex;flex-direction:column;justify-content:center;gap:8px">
+                    <button type="button" class="tf-btn tf-r">▶</button>
+                    <button type="button" class="tf-btn tf-l">◀</button>
+                </div>
+                <div style="flex:1;border:1px solid #ddd;border-radius:6px;display:flex;flex-direction:column;background:#fff">
+                    <div style="padding:6px 10px;border-bottom:1px solid #ddd;font-size:12px;color:#666;background:#e6f7ff;border-radius:6px 6px 0 0">选中且排序（自上而下）</div>
+                    <ul class="tf-right" style="list-style:none;padding:5px;margin:0;flex:1;overflow-y:auto">
+                        ${sel.map(k => `<li data-val="${k}" class="tf-item">${dataMap[k]}</li>`).join('')}
+                    </ul>
+                </div>
+                <div style="display:flex;flex-direction:column;justify-content:center;gap:8px">
+                    <button type="button" class="tf-btn tf-up">▲</button>
+                    <button type="button" class="tf-btn tf-dn">▼</button>
+                </div>
+            </div>`;
+        const L = ct.querySelector('.tf-left'), R = ct.querySelector('.tf-right');
+        ct.querySelectorAll('ul').forEach(ul => ul.addEventListener('click', e => {
+            if (e.target.tagName === 'LI') { ct.querySelectorAll('.tf-item').forEach(i => i.classList.remove('active')); e.target.classList.add('active'); }
+        }));
+        ct.querySelector('.tf-r').onclick  = () => { const a = L.querySelector('.active'); if (a) { R.appendChild(a); a.classList.remove('active'); } };
+        ct.querySelector('.tf-l').onclick  = () => { const a = R.querySelector('.active'); if (a) { L.appendChild(a); a.classList.remove('active'); } };
+        ct.querySelector('.tf-up').onclick = () => { const a = R.querySelector('.active'); if (a?.previousElementSibling) R.insertBefore(a, a.previousElementSibling); };
+        ct.querySelector('.tf-dn').onclick = () => { const a = R.querySelector('.active'); if (a?.nextElementSibling) R.insertBefore(a.nextElementSibling, a); };
+        return () => [...R.querySelectorAll('.tf-item')].map(i => i.dataset.val).join(',');
+    }
+ 
+    function openConfigPanel() {
+        document.getElementById('glm-cfg-ov')?.remove();
+        if (!document.getElementById('glm-tf-s')) {
+            const s = document.createElement('style'); s.id = 'glm-tf-s';
+            s.textContent = '.tf-item{padding:6px 10px;margin-bottom:4px;border-radius:4px;cursor:pointer;font-size:13px;color:#333;border:1px solid transparent;transition:all .15s}.tf-item:hover{background:#f5f5f5}.tf-item.active{background:#e6f7ff;border-color:#91d5ff;color:#1890ff;font-weight:700}.tf-btn{padding:4px 8px;font-size:10px;cursor:pointer;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#555;height:28px;transition:.2s}.tf-btn:hover{border-color:#40a9ff;color:#40a9ff}';
+            document.head.appendChild(s);
+        }
+        const ov = document.createElement('div'); ov.id = 'glm-cfg-ov';
+        ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:2147483646;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px);font-family:system-ui,sans-serif';
+        const panel = document.createElement('div');
+        panel.style.cssText = 'background:#fff;color:#333;width:560px;padding:24px;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.3);max-height:90vh;overflow-y:auto';
+        panel.innerHTML = `
+            <h3 style="margin:0 0 20px;font-size:18px;color:#1a1a1a">⚙️ 抢购助手配置</h3>
+            <div id="glm-wp"></div>
+            <div id="glm-wt"></div>
+            <div style="margin-bottom:20px;padding-top:10px;border-top:1px dashed #eee;display:flex;flex-direction:column;gap:12px">
+                <label style="display:flex;align-items:center;cursor:pointer">
+                    <input type="checkbox" id="glm-sm" ${CFG.SMART_REFRESH ? 'checked' : ''} style="margin-right:8px">
+                    <span style="font-size:14px;color:#555">启用智能刷新（梯度嗅探补货时间）</span>
+                </label>
+                <label style="display:flex;align-items:center;cursor:pointer">
+                    <input type="checkbox" id="glm-aci" ${CFG.AUTO_CLOSE_INVALID ? 'checked' : ''} style="margin-right:8px">
+                    <span style="font-size:14px;color:#555">自动关闭无效支付/限流弹窗（默认关闭）</span>
+                    <span title="默认关闭，需手动开启才会自动关闭。&#10;开启后自动关闭以下弹窗并重试：&#10;1. 接口返回售罄但前端弹出的支付弹窗（二维码支付链接缺参数，扫码也无法付款）&#10;2. 限流弹窗（自动关闭后继续重试）&#10;关闭后遇到异常弹窗会停脚本，需手动处理" style="margin-left:6px;cursor:help;color:#999;font-size:14px;border:1px solid #ccc;border-radius:50%;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;line-height:1">?</span>
+                </label>
+                <label style="display:flex;align-items:center;cursor:pointer">
+                    <input type="checkbox" id="glm-acs" ${CFG.AUTO_CLICK_SUB ? 'checked' : ''} style="margin-right:8px">
+                    <span style="font-size:14px;color:#555">自动点击订阅</span>
+                    <span title="开启后脚本发现可购买的套餐会自动点击订阅按钮。&#10;关闭后只报警提醒，需手动点击（适合想自己掌控点击时机的场景）。" style="margin-left:6px;cursor:help;color:#999;font-size:14px;border:1px solid #ccc;border-radius:50%;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;line-height:1">?</span>
+                </label>
+                <label style="display:flex;align-items:center;cursor:pointer">
+                    <input type="checkbox" id="glm-acc" ${CFG.AUTO_CAPTCHA_CLICK ? 'checked' : ''} style="margin-right:8px">
+                    <span style="font-size:14px;color:#555">自动点击验证码文字</span>
+                    <span title="开启后会把本地识别出的验证码文字坐标自动点到图上。关闭后只识别和记录，不自动点图。" style="margin-left:6px;cursor:help;color:#999;font-size:14px;border:1px solid #ccc;border-radius:50%;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;line-height:1">?</span>
+                </label>
+                <label style="display:flex;align-items:center;cursor:pointer">
+                    <input type="checkbox" id="glm-acf" ${CFG.AUTO_CAPTCHA_CONFIRM ? 'checked' : ''} style="margin-right:8px">
+                    <span style="font-size:14px;color:#555">自动点击验证码确定</span>
+                    <span title="默认关闭。开启后点完验证码文字会自动点确定；关闭后需要你手动点确定。" style="margin-left:6px;cursor:help;color:#999;font-size:14px;border:1px solid #ccc;border-radius:50%;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;line-height:1">?</span>
+                </label>
+                <label style="display:flex;align-items:center;cursor:pointer">
+                    <input type="checkbox" id="glm-tm" ${CFG.TEST_MODE ? 'checked' : ''} style="margin-right:8px">
+                    <span style="font-size:14px;color:#555">启用测试模式</span>
+                    <span title="开启后在页面右下角显示测试面板，可测试后端连接、验证码识别和点击确认。&#10;测试时不会触发抢购逻辑。" style="margin-left:6px;cursor:help;color:#999;font-size:14px;border:1px solid #ccc;border-radius:50%;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;line-height:1">?</span>
+                </label>
+            </div>
+            <div style="display:flex;justify-content:space-between;gap:10px">
+                <button id="glm-multi" style="padding:8px 16px;border:1px solid #52c41a;background:#f6ffed;color:#52c41a;border-radius:6px;cursor:pointer;font-weight:600">🚀 一键多开</button>
+                <div style="display:flex;gap:10px">
+                    <button id="glm-cc" style="padding:8px 16px;border:1px solid #ddd;background:#f5f5f5;border-radius:6px;cursor:pointer;color:#666">取消</button>
+                    <button id="glm-cs" style="padding:8px 20px;border:none;background:#1890ff;color:#fff;border-radius:6px;cursor:pointer;font-weight:700">保存并刷新</button>
+                </div>
+            </div>`;
+        ov.appendChild(panel);
+        document.body.appendChild(ov);
+        const getPkgs = buildTransferBox(document.getElementById('glm-wp'), PKGS_MAP, CFG.PACKAGES_PRIORITY, '套餐优先级');
+        const getTabs = buildTransferBox(document.getElementById('glm-wt'), TABS_MAP, CFG.TABS_PRIORITY, '订阅周期优先级');
+        panel.querySelector('#glm-cc').onclick = () => ov.remove();
+        panel.querySelector('#glm-multi').onclick = () => { openMultipleWindows(); };
+        panel.querySelector('#glm-cs').onclick = () => {
+            const p = getPkgs(), t = getTabs();
+            if (!p || !t) { alert('请至少各选一个！'); return; }
+            saveCfg({
+                TABS_PRIORITY     : t,
+                PACKAGES_PRIORITY : p,
+                SMART_REFRESH     : panel.querySelector('#glm-sm').checked,
+                CHECK_INTERVAL    : CFG.CHECK_INTERVAL,
+                AUTO_CLOSE_INVALID: panel.querySelector('#glm-aci').checked,
+                AUTO_CLICK_SUB    : panel.querySelector('#glm-acs').checked,
+                AUTO_CAPTCHA_CLICK: panel.querySelector('#glm-acc').checked,
+                AUTO_CAPTCHA_CONFIRM: panel.querySelector('#glm-acf').checked,
+                TEST_MODE: panel.querySelector('#glm-tm').checked,
+                SAFE_DEFAULTS_VERSION,
+            });
+            ov.remove(); alert('已保存，即将刷新。'); location.reload();
+        };
+        ov.onclick = e => { if (e.target === ov) ov.remove(); };
+    }
+ 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  主循环
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 弹窗首次可见时间记录（防止刚出现就误关闭）
+    let popupFirstSeen = 0;
+    const POPUP_MIN_MS = 800;
+
+    function tick() {
+        if (state === 'DONE') return;
+
+        // ESC 关闭弹窗后立即触发特惠订阅重检
+        if (pendingRecheck) {
+            pendingRecheck = false;
+            state = 'SCANNING'; qIdx = 0; sweepRestocks = []; sweepBusyCount = 0;
+            const r = findOtherSubscriptionBtn();
+            if (r && r.ok === 1) {
+                taskTarget = { tab: -1, pkg: -1, text: r.text }; taskPhase = 'IDLE'; taskRLCount = 0;
+                state = 'TASK_UNIT';
+                setBar(`🎯 发现可购（特惠订阅），即将点击...`, '#389e0d');
+                return;
+            }
+        }
+
+        // 全局弹窗监控：任何时候出现支付弹窗、限流弹窗、无效弹窗，根据设置自动处理
+        const rlw = findRLModal();
+        if (rlw) {
+            popupFirstSeen = popupFirstSeen || Date.now();
+            if (Date.now() - popupFirstSeen < POPUP_MIN_MS) { setBar('⏳ 弹窗出现，等待稳定后处理...', '#d46b08'); return; }
+            if (CFG.AUTO_CLOSE_INVALID) {
+                closeModal(rlw);
+                popupFirstSeen = 0;
+                console.log('[GLM] tick 自动关闭限流弹窗');
+            } else {
+                setBar('⚠️ 限流弹窗（"购买人数较多"），请手动关闭后重试', '#d46b08');
+            }
+            return;
+        }
+        const payDlg = getPayDialog();
+        if (payDlg) {
+            popupFirstSeen = popupFirstSeen || Date.now();
+            if (Date.now() - popupFirstSeen < POPUP_MIN_MS) { setBar('⏳ 支付弹窗出现，等待稳定后处理...', '#d46b08'); return; }
+            const verdict = checkPayDialog();
+            if (verdict === 'close') {
+                if (CFG.AUTO_CLOSE_INVALID) {
+                    closePayDialog();
+                    popupFirstSeen = 0;
+                    console.log('[GLM] tick 自动关闭支付弹窗(', verdict, ')');
+                } else {
+                    state = 'DONE';
+                    popupFirstSeen = 0;
+                    setBar('⚠️ 检测到异常支付弹窗，请手动确认是否需要扫码！', '#d46b08');
+                }
+                return;
+            }
+            if (verdict === 'keep') {
+                popupFirstSeen = 0;
+                if (taskPhase !== 'PAYING') {
+                    if (everSucceeded) showPayAlarm();
+                    setBar('💳 <b>支付弹窗已出现！请立即扫码支付！</b>', '#16a34a');
+                }
+                return;
+            }
+        }
+        popupFirstSeen = 0;
+
+        // 特惠订阅兜底检测（任一时间发现特惠订阅按钮就进入 TASK_UNIT）
+        if (state === 'SCANNING') {
+            const r = findOtherSubscriptionBtn();
+            if (r && r.ok === 1) {
+                taskTarget = { tab: -1, pkg: -1, text: r.text }; taskPhase = 'IDLE'; taskRLCount = 0;
+                state = 'TASK_UNIT';
+                setBar(`🎯 发现可购（特惠订阅），即将点击...`, '#389e0d');
+                return;
+            }
+        }
+
+        if (state === 'SLEEPING') {
+            const rem = sleepUntil - Date.now();
+            if (rem <= 0) {
+                if (isGoldenTime()) {
+                    setBar('🔥 黄金时间！取消刷新，继续高频监控！', '#ff4d4f');
+                    state = 'SCANNING'; qIdx = 0; sweepRestocks = [];
+                } else {
+                    location.replace(GLM_CODING_URL());
+                }
+            } else {
+                setBar(`💤 休眠中，<b>${fmt(rem)}</b> 后刷新`, '#434343');
+            }
+            return;
+        }
+        if (state === 'TASK_UNIT') { doTaskUnit(); return; }
+        doScan();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  SCANNING / TASK_UNIT 逻辑
+    // ═══════════════════════════════════════════════════════════════════════════
+    function doScan() {
+        if (qIdx >= scanQueue.length) { onSweepDone(); return; }
+        const { tab, pkg } = scanQueue[qIdx];
+        if (tab === -1) {
+            const r = findOtherSubscriptionBtn();
+            if (r && r.ok === 1) {
+                taskTarget = { tab: -1, pkg: -1, text: r.text }; taskPhase = 'IDLE'; taskRLCount = 0;
+                state = 'TASK_UNIT';
+                setBar(`🎯 发现可购（特惠订阅），即将点击...`, '#389e0d');
+                return;
+            }
+            qIdx++; return;
+        }
+        const te = tabEl(tab);
+        if (!te) return;
+        if (!te.classList.contains('active')) {
+            te.click(); te.scrollIntoView({ behavior: 'auto', block: 'center' });
+            lastTabSwitch = Date.now(); setBar(`🔄 切换到 ${TABS_MAP[tab]}...`); return;
+        }
+        if (Date.now() - lastTabSwitch < 400) return;
+
+        const b = btnEl(pkg);
+        if (canBuy(b)) {
+            taskTarget = { tab, pkg }; taskPhase = 'IDLE'; taskRLCount = 0;
+            setS(tab, pkg, 0); state = 'TASK_UNIT';
+            setBar(`🎯 发现可购！${TABS_MAP[tab]} · ${PKGS_MAP[pkg]}，即将点击...`, '#389e0d');
+            return;
+        }
+
+        const otherBtn = findOtherSubscriptionBtn();
+        if (otherBtn && otherBtn !== b) {
+            taskTarget = { tab: -1, pkg: -1, btn: otherBtn }; taskPhase = 'IDLE'; taskRLCount = 0;
+            state = 'TASK_UNIT';
+            setBar(`🎯 发现可购（特惠订阅），即将点击...`, '#389e0d');
+            return;
+        }
+
+        if (isBusy(b)) {
+            sweepBusyCount++;
+            setBar(`⚡ 系统繁忙 ${TABS_MAP[tab]} · ${PKGS_MAP[pkg]}，跳过...`);
+            qIdx++; return;
+        }
+
+        const ri = parseRestock(b?.innerText);
+        if (ri?.dateStr === todayStr() && ri.msUntil > 0) sweepRestocks.push(ri);
+
+        setBar(`🔍 扫描 ${TABS_MAP[tab]} · ${PKGS_MAP[pkg]} (${qIdx + 1}/${scanQueue.length})`);
+        qIdx++;
+    }
+ 
+    function onSweepDone() {
+        // 空队列 + sentinel → 持续轮询查找特惠订阅
+        if (scanQueue.length === 1 && scanQueue[0].tab === -1) {
+            qIdx = 0; sweepRestocks = []; sweepBusyCount = 0;
+            setBar('🔍 未找到可购套餐或特惠订阅，持续监控中...', '#434343');
+            return;
+        }
+        if (sweepBusyCount >= scanQueue.length) {
+            setBar('⚡ 所有套餐系统繁忙(batch-preview 555)，刷新页面重试...', '#d46b08');
+            setTimeout(() => location.replace(GLM_CODING_URL()), 1500);
+            return;
+        }
+        if (!sweepRestocks.length && isGoldenTime()) {
+            setBar(`🔥 黄金时间！系统繁忙中，持续高频监控！`, '#ff4d4f');
+            qIdx = 0; sweepRestocks = []; sweepBusyCount = 0; return;
+        }
+        if (!sweepRestocks.length) {
+            state = 'DONE'; setBar('📭 今日全部售罄，脚本停止。', '#434343'); triggerPromo(); return;
+        }
+        sweepRestocks.sort((a, b) => a.msUntil - b.msUntil);
+        const nearest = sweepRestocks[0];
+        const sleep   = calcSleepMs(nearest.msUntil);
+ 
+        // ── v8.0: 黄金时间（9:50-10:10）禁止刷新页面 ──────────────────────────
+        if (isGoldenTime()) {
+            setBar(`🔥 黄金时间！补货倒计时 <b>${fmt(nearest.msUntil)}</b>，禁止刷新，高频监控！`, '#ff4d4f');
+            qIdx = 0; sweepRestocks = []; return;
+        }
+ 
+        if (sleep === 0) {
+            setBar(`⚡ 补货倒计时 <b>${fmt(nearest.msUntil)}</b>，高频监控！`, '#d4380d');
+            qIdx = 0; sweepRestocks = []; return;
+        }
+        if (CFG.SMART_REFRESH) {
+            state = 'SLEEPING'; sleepUntil = Date.now() + sleep;
+            setBar(`💤 补货还需 <b>${fmt(nearest.msUntil)}</b>，<b>${fmt(sleep)}</b> 后刷新`, '#434343');
+        } else { qIdx = 0; sweepRestocks = []; }
+    }
+ 
+    function doTaskUnit() {
+        const { tab, pkg, btn: altBtn } = taskTarget;
+        if (tab === -1 && !altBtn) {
+            if (taskPhase === 'IDLE') {
+                const r = findOtherSubscriptionBtn();
+                if (!r || r.ok !== 1) {
+                    exitTask(); return;
+                }
+                if (!CFG.AUTO_CLICK_SUB) {
+                    showPayAlarm();
+                    setBar(`🎯 <b>发现可购（特惠订阅）</b>，请手动点击订阅`, '#389e0d');
+                    return;
+                }
+                PS.result = null; PS.inProgress = true;
+                clickSubBtn2(r.pkg); taskClickTime = Date.now(); taskPhase = 'WAITING';
+                setBar(`🔄 已点击特惠订阅，接口重试中...（限流 ${taskRLCount}/${MAX_RL}）`, '#d46b08');
+                return;
+            }
+            if (taskPhase === 'WAITING') {
+                const rlw = findRLModal();
+                if (rlw) {
+                    if (isAirplanePayDialog(rlw)) {
+                        if (PS.result !== 'busy' && PS.result !== 'sold_out') {
+                            setBar('⚠️ 特惠订阅: API返回200但弹窗显示小飞机，可能是前后端不一致。不自动关闭。', '#ff4d4f');
+                            return;
+                        }
+                        if (!CFG.AUTO_CLOSE_INVALID) {
+                            state = 'DONE';
+                            setBar('Auto-close disabled. Please check this payment/rate-limit popup manually.', '#d46b08');
+                            return;
+                        }
+                        closeModal(rlw);
+                        taskTarget = null; taskPhase = 'IDLE'; taskRLCount = 0;
+                        state = 'SCANNING';
+                        setBar(`✈️ 特惠订阅: 系统繁忙，关闭弹窗，继续扫描...`, '#d46b08');
+                        return;
+                    }
+                    if (!CFG.AUTO_CLOSE_INVALID) {
+                        setBar('⚠️ 特惠订阅: 限流弹窗，请手动关闭后重试', '#d46b08');
+                        return;
+                    }
+                    closeModal(rlw); taskRLCount++;
+                    if (taskRLCount >= MAX_RL) {
+                        if (isGoldenTime()) {
+                            setBar('🔥 黄金时间！连续限流但禁止刷新，继续重试！', '#ff4d4f');
+                            taskRLCount = 0; taskPhase = 'IDLE';
+                        } else {
+                            setBar(`🔁 连续 ${MAX_RL} 次限流，即将刷新...`, '#cf1322');
+                            setTimeout(() => location.replace(GLM_CODING_URL()), 50);
+                        }
+                        return;
+                    }
+                    setBar(`⚠️ 特惠订阅: 限流 ${taskRLCount}/${MAX_RL}，自动关闭后重试...`, '#d46b08');
+                    taskPhase = 'IDLE'; return;
+                }
+                if (isPayDialog()) {
+                    const verdict = checkPayDialog();
+                    if (verdict === 'close') {
+                        if (!CFG.AUTO_CLOSE_INVALID) {
+                            state = 'DONE';
+                            setBar('⚠️ 特惠订阅: 检测到异常支付弹窗，请手动确认！', '#d46b08');
+                            return;
+                        }
+                        closePayDialog();
+                        taskTarget = null; taskPhase = 'IDLE'; taskRLCount = 0;
+                        state = 'SCANNING';
+                        setBar(`📉 特惠订阅: 支付弹窗异常，关闭弹窗，继续扫描...`, '#d46b08');
+                        return;
+                    }
+                    if (verdict === 'warn') {
+                        state = 'DONE';
+                        setBar('⚠️ 特惠订阅: 弹窗出现小飞机但接口无异常，请手动确认！', '#ff4d4f');
+                        return;
+                    }
+                }
+                if (isSuccessDialog()) {
+                    state = 'DONE';
+                    mtNotifyClick();
+                    setBar('🎉 特惠订阅成功！恭喜！', '#237804'); return;
+                }
+                const elapsed = Date.now() - taskClickTime;
+                setBar(`⌛ 特惠订阅: 等待中... (${(elapsed/1000).toFixed(1)}s)`, '#1677ff');
+                if (elapsed > 3000) {
+                    if (isSoldOut(altBtn)) exitTask(); else taskPhase = 'IDLE';
+                }
+                return;
+            }
+        }
+        const te = tabEl(tab);
+        if (!te) return;
+        if (!te.classList.contains('active')) { te.click(); return; }
+        const b = btnEl(pkg);
+ 
+        if (taskPhase === 'IDLE') {
+            if (isSoldOut(b)) { exitTask(); return; }
+            if (!canBuy(b)) {
+                setBar(`⏳ 等待按钮就绪... ${TABS_MAP[tab]} · ${PKGS_MAP[pkg]}`, '#d46b08');
+                return;
+            }
+            if (!CFG.AUTO_CLICK_SUB) {
+                showPayAlarm();
+                setBar(`🎯 <b>发现可购！${TABS_MAP[tab]} · ${PKGS_MAP[pkg]}</b>，请手动点击订阅`, '#389e0d');
+                return;
+            }
+            PS.result = null; PS.inProgress = true;
+            b.click(); taskClickTime = Date.now(); taskPhase = 'WAITING';
+            setBar(`🔄 已点击，接口重试中... ${TABS_MAP[tab]} · ${PKGS_MAP[pkg]}（限流 ${taskRLCount}/${MAX_RL}）`, '#d46b08');
+            return;
+        }
+ 
+        if (taskPhase === 'WAITING') {
+            const rlw = findRLModal();
+            if (rlw) {
+                if (isAirplanePayDialog(rlw)) {
+                    if (PS.result !== 'busy' && PS.result !== 'sold_out') {
+                        setBar('⚠️ API返回200但弹窗显示小飞机（"购买人数较多"），可能是前后端不一致。不自动关闭，请手动确认后关闭弹窗，脚本会继续。', '#ff4d4f');
+                        return;
+                    }
+                    if (!CFG.AUTO_CLOSE_INVALID) {
+                        state = 'DONE';
+                        setBar('Auto-close is disabled. Please check this payment/rate-limit popup manually.', '#d46b08');
+                        return;
+                    }
+                    closeModal(rlw);
+                    const curName = `${TABS_MAP[tab]}·${PKGS_MAP[pkg]}`;
+                    const nextIdx = qIdx + 1;
+                    const isLoop = nextIdx >= scanQueue.length;
+                    qIdx = isLoop ? 0 : nextIdx;
+                    taskTarget = null; taskPhase = 'IDLE'; taskRLCount = 0;
+                    state = 'SCANNING';
+                    const reason = PS.result === 'busy'
+                        ? `✈️ 系统繁忙(${PS.rawCode || 555})，关闭弹窗`
+                        : `📉 ${curName} 售罄`;
+                    lastCloseReason = reason;
+                    setBar(`${reason}，${isLoop ? '🔄 轮询一圈，从头重试...' : '试下一个...'}`, '#d46b08');
+                    return;
+                }
+
+                if (!CFG.AUTO_CLOSE_INVALID) {
+                    setBar('⚠️ 限流弹窗（"购买人数较多"），请手动关闭后重试', '#d46b08');
+                    return;
+                }
+                closeModal(rlw); taskRLCount++;
+                if (taskRLCount >= MAX_RL) {
+                    if (isGoldenTime()) {
+                        setBar('🔥 黄金时间！连续限流但禁止刷新，继续重试！', '#ff4d4f');
+                        taskRLCount = 0; taskPhase = 'IDLE';
+                    } else {
+                        setBar(`🔁 连续 ${MAX_RL} 次限流，即将刷新...`, '#cf1322');
+                        setTimeout(() => location.replace(GLM_CODING_URL()), 50);
+                    }
+                    return;
+                }
+                setBar(`⚠️ 限流 ${taskRLCount}/${MAX_RL}，自动关闭后重试...`, '#d46b08');
+                taskPhase = 'IDLE'; return;
+            }
+
+            if (isPayDialog()) {
+                const verdict = checkPayDialog();
+
+                if (verdict === 'close') {
+                    if (!CFG.AUTO_CLOSE_INVALID) {
+                        state = 'DONE';
+                        setBar('⚠️ 检测到异常支付弹窗，请手动确认是否需要扫码！', '#d46b08');
+                        return;
+                    }
+                    const reason = everSucceeded
+                        ? `📉 支付弹窗无价格（无效支付），关闭弹窗`
+                        : PS.result === 'busy'
+                            ? `✈️ 系统繁忙(${PS.rawCode || 555})，关闭弹窗`
+                            : `📉 ${TABS_MAP[taskTarget.tab]}·${PKGS_MAP[taskTarget.pkg]} 售罄`;
+                    closePayDialog();
+                    lastCloseReason = reason;
+                    const nextIdx = qIdx + 1;
+                    const isLoop = nextIdx >= scanQueue.length;
+                    qIdx = isLoop ? 0 : nextIdx;
+                    taskTarget = null; taskPhase = 'IDLE'; taskRLCount = 0;
+                    state = 'SCANNING';
+                    setBar(`${reason}，${isLoop ? '🔄 轮询一圈，从头重试...' : '试下一个...'} `, '#d46b08');
+                    return;
+                }
+
+                if (verdict === 'warn') {
+                    setBar('⚠️ 弹窗显示小飞机但API未返回繁忙/售罄，前后端不一致。不自动关闭，请手动确认。如果有二维码请扫码支付！', '#ff4d4f');
+                    return;
+                }
+
+                const prices = readDialogPrices();
+                if (everSucceeded || prices?.any) {
+                    state = 'DONE';
+                    if (everSucceeded) showPayAlarm();
+                    setBar('💳 <b>支付弹窗已出现！请立即扫码支付！</b> 脚本已停止。', '#16a34a');
+                } else {
+                    setBar(`🔄 ${TABS_MAP[tab]}·${PKGS_MAP[pkg]} 弹窗等待确认...`, '#1677ff');
+                }
+                return;
+            }
+
+            if (isSuccessDialog()) {
+                setS(tab, pkg, 2); state = 'DONE';
+                mtNotifyClick();
+                setBar('🎉 订阅成功！恭喜！', '#237804'); return;
+            }
+
+            if (!PS.inProgress && PS.result === 'sold_out' && Date.now() - taskClickTime > 2000) {
+                exitTask(); return;
+            }
+
+            const elapsed = Date.now() - taskClickTime;
+            const prefix = lastCloseReason ? `${lastCloseReason} → ` : '';
+            if (PS.inProgress) {
+                setBar(`${prefix}⏳ ${TABS_MAP[tab]}·${PKGS_MAP[pkg]} 接口请求中... (${(elapsed/1000).toFixed(1)}s)`, '#1677ff');
+            } else {
+                setBar(`${prefix}🔐 ${TABS_MAP[tab]}·${PKGS_MAP[pkg]} 等待验证码... (${(elapsed/1000).toFixed(1)}s)`, '#1677ff');
+            }
+
+            if (elapsed > MODAL_WAIT) {
+                if (isSoldOut(b)) exitTask(); else taskPhase = 'IDLE';
+            }
+        }
+    }
+ 
+    function exitTask() {
+        if (taskTarget && taskTarget.tab >= 0) {
+            if (!isGoldenTime()) {
+                setS(taskTarget.tab, taskTarget.pkg, 1);
+            }
+            setBar(`📦 ${TABS_MAP[taskTarget.tab]} · ${PKGS_MAP[taskTarget.pkg]} 售罄，继续...`);
+        } else {
+            setBar(`📦 特惠订阅 不可用，继续...`);
+        }
+        qIdx++; taskTarget = null; taskPhase = 'IDLE'; taskRLCount = 0;
+        state = 'SCANNING';
+    }
+ 
+    // ── v8.4: DOM 级按钮强制启用（安全网）─────────────────────────────────────
+    function forceEnableButtons() {
+        document.querySelectorAll('.buy-btn[disabled], .buy-btn.is-disabled, .buy-btn.disabled').forEach(b => {
+            b.removeAttribute('disabled');
+            b.classList.remove('is-disabled', 'disabled');
+        });
+    }
+
+    // ── 启动 ──────────────────────────────────────────────────────────────────
+    // v8.0: 未登录检测
+    function checkLogin() {
+        const token = document.cookie.match(/bigmodel_token_production=([^;]+)/)?.[1];
+        if (!token) {
+            setBar('⚠️ 未登录，请先注册/登录', '#ff4d4f');
+            setTimeout(() => {
+                if (confirm('检测到未登录，是否前往注册页面？\n\n使用邀请码注册可获得额外优惠！')) {
+                    window.location.href = 'https://www.bigmodel.cn/invite?icode=PKFZ8PflAmrZ4AYh%2BAPxo33uFJ1nZ0jLLgipQkYjpcA%3D';
+                }
+            }, 1000);
+            return false;
+        }
+        return true;
+    }
+ 
+    if (checkLogin()) {
+        // 清除失效的旧抢购通知（超过 30s 的）
+        if (GM_getValue('mt_clicked', 0) && (Date.now() - GM_getValue('mt_clicked', 0)) > 30000) {
+            GM_setValue('mt_clicked', 0);
+        }
+        let pageReady = false;
+        const _readyCheck = setInterval(() => {
+            if (document.querySelector('.glm-coding-package-list') || document.querySelector('#switchTabBox')) {
+                pageReady = true; clearInterval(_readyCheck);
+                setBar('✅ 套餐列表已加载，3秒后开始监控...', '#1677ff');
+                setTimeout(() => { setBar('✅ 页面已就绪，开始监控...', '#1677ff'); }, 3000);
+            }
+        }, 200);
+        setTimeout(() => { pageReady = true; clearInterval(_readyCheck); }, 12000);
+        let pageReadyAt = 0, tabPreSwitched = false;
+        const _origTick = () => {
+            if (!pageReady) { setBar('⏳ 页面加载中，等待套餐列表...', '#1677ff'); return; }
+            if (!pageReadyAt) { pageReadyAt = Date.now(); }
+            // 多开：收到其他窗口的抢购成功通知（30s 内有效）→ DONE
+            const mtClickedTs = GM_getValue('mt_clicked', 0);
+            if (mtChannel && state !== 'DONE' && myWi > 0 && mtClickedTs && (Date.now() - mtClickedTs) < 30000) {
+                state = 'DONE';
+                setBar('⏹️ 其他窗口已抢购成功，本窗口停止', '#434343');
+                return;
+            }
+            if (Date.now() - pageReadyAt < 3000) {
+                setBar('⏳ 页面加载中，等待验证码脚本...', '#1677ff');
+                if (!tabPreSwitched && tabs && tabs.length) {
+                    const te = tabEl(tabs[0]);
+                    if (te && !te.classList.contains('active')) {
+                        te.click(); te.scrollIntoView({ behavior: 'auto', block: 'center' });
+                        console.log('[GLM] 缓冲期预切换标签页到', TABS_MAP[tabs[0]]);
+                    }
+                    tabPreSwitched = true;
+                }
+                return;
+            }
+            tick();
+        };
+        // 多开错开：myWi=0 立即启动，myWi=N 延迟 N*MT_STAGGER ms
+        const startDelay = Math.max(0, mtInitialDelay);
+        setTimeout(() => {
+            setInterval(_origTick, CFG.CHECK_INTERVAL);
+            console.log(`[GLM] MT: tab #${myWi} interval started after ${startDelay}ms stagger`);
+        }, startDelay);
+        const _startDOM = () => {
+            setInterval(forceEnableButtons, 500);
+            new MutationObserver(forceEnableButtons).observe(document.body, {
+                childList: true, subtree: true,
+                attributes: true, attributeFilter: ['disabled', 'class']
+            });
+        };
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _startDOM);
+        else _startDOM();
+    }
+ 
+})();
+
+// ---- captcha prompt bridge v2: multi-window rush mode ----
+(function () {
+    'use strict';
+
+    if (window.__glmCaptchaPromptBridge === 1) return;
+    window.__glmCaptchaPromptBridge = 1;
+
+    const CAPTCHA_CFG = (() => {
+        try {
+            const raw = GM_getValue('glm_coding_config_v5', '{}');
+            return { AUTO_CAPTCHA_CLICK: true, AUTO_CAPTCHA_CONFIRM: false, ...JSON.parse(raw || '{}') };
+        } catch {
+            return { AUTO_CAPTCHA_CLICK: true, AUTO_CAPTCHA_CONFIRM: false };
+        }
+    })();
+
+
+
+    let lastCaptchaText = '';
+    let captchaSent = false;
+    let rushState = 'idle';
+
+    function serverRequest(method, path, data) {
+        return new Promise((resolve, reject) => {
+            try {
+                if (typeof GM_xmlhttpRequest !== 'undefined') {
+                    GM_xmlhttpRequest({
+                        method: method,
+                        url: 'http://localhost:8888' + path,
+                        headers: { 'Content-Type': 'application/json' },
+                        data: data ? JSON.stringify(data) : undefined,
+                        onload: (r) => {
+                            try { resolve(JSON.parse(r.responseText)); }
+                            catch { resolve({ raw: r.responseText }); }
+                        },
+                        onerror: () => {
+                            fetch('http://localhost:8888' + path, {
+                                method: method,
+                                headers: { 'Content-Type': 'application/json' },
+                                body: data ? JSON.stringify(data) : undefined,
+                            }).then(r => r.json()).then(resolve).catch(reject);
+                        },
+                    });
+                } else {
+                    fetch('http://localhost:8888' + path, {
+                        method: method,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: data ? JSON.stringify(data) : undefined,
+                    }).then(r => r.json()).then(resolve).catch(reject);
+                }
+            } catch (e) { reject(e); }
+        });
+    }
+
+    function findAndClickConfirm() {
+        var selectors = [
+            '.tencent-captcha-dy__btn-confirm',
+            '.tencent-captcha-dy__footer .btn',
+            '.pay-dialog button.el-button--primary',
+            '.el-dialog__wrapper:not([style*="display: none"]) .el-button--primary',
+            '[class*="captcha"] [class*="confirm"]',
+            '[class*="captcha"] [class*="submit"]',
+        ];
+        for (var si = 0; si < selectors.length; si++) {
+            var btns = document.querySelectorAll(selectors[si]);
+            for (var bi = 0; bi < btns.length; bi++) {
+                var btn = btns[bi];
+                if (!btn) continue;
+                var style = getComputedStyle(btn);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                var rect = btn.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) continue;
+                console.log('[captcha-rush] click confirm: ' + selectors[si]);
+                btn.click();
+                return true;
+            }
+        }
+    }
+
+    function getCaptchaPromptText(el) {
+        if (!el) return '';
+        var raw = (
+            el.getAttribute('aria-label') ||
+            el.getAttribute('title') ||
+            el.textContent ||
+            ''
+        ).trim();
+        return raw.replace(/^\u8BF7\u4F9D\u6B21\u70B9\u51FB[:\uff1a]?\s*/, '').trim();
+    }
+
+    function isPointClickPrompt(text) {
+        if (!text) return false;
+        if (/(\u62D6\u52A8|\u62FC\u56FE|\u6ED1\u5757)/.test(text)) return false;
+        if (/^\u8BF7\u4F9D\u6B21\u70B9\u51FB/.test(text)) return true;
+        var chars = (text.match(/[\u4e00-\u9fff]/g) || []);
+        return chars.length >= 3 && chars.length <= 8;
+    }
+
+    function extractCaptchaChars(text) {
+        var chars = (text || '').match(/[\u4e00-\u9fff]/g) || [];
+        return chars.slice(-3);
+    }
+
+    function findCaptchaContainer() {
+        var MIN_AREA = 20000;
+        var candidates = [];
+        var selectors = [
+            '.tencent-captcha-dy__image',
+            '.tencent-captcha-dy__bg-img',
+            '.tencent-captcha-dy__bg',
+            '.tencent-captcha-dy__body',
+            '[class*="captcha-dy"] [class*="image"]',
+            '[class*="captcha-dy"] [class*="bg"]',
+            'img[class*="captcha"]',
+            'div[class*="captcha"] img',
+            'canvas[class*="captcha"]',
+            '[class*="captcha-dy"] img',
+            '[class*="captcha-dy"] canvas',
+        ];
+        for (var i = 0; i < selectors.length; i++) {
+            var els = document.querySelectorAll(selectors[i]);
+            for (var k = 0; k < els.length; k++) {
+                var el = els[k];
+                if (!el || !visible(el)) continue;
+                var r = el.getBoundingClientRect();
+                var area = r.width * r.height;
+                if (area >= MIN_AREA) {
+                    candidates.push({ el: el, area: area, w: r.width, h: r.height });
+                    console.log('[captcha] candidate: ' + selectors[i] + ' size=' + Math.round(r.width) + 'x' + Math.round(r.height));
+                }
+            }
+        }
+
+        if (candidates.length === 0) {
+            var allImgs = document.querySelectorAll('img');
+            for (var j = 0; j < allImgs.length; j++) {
+                var img = allImgs[j];
+                if (!visible(img)) continue;
+                var ir = img.getBoundingClientRect();
+                var iarea = ir.width * ir.height;
+                if (iarea >= MIN_AREA) {
+                    var parent = img.closest('[class*="captcha"]');
+                    if (parent) {
+                        candidates.push({ el: img, area: iarea, w: ir.width, h: ir.height });
+                    }
+                }
+            }
+        }
+
+        if (candidates.length === 0) {
+            var wrapSelectors = [
+                '.tencent-captcha-dy__wrap',
+                '.tencent-captcha-dy__container',
+                '[id*="tcaptcha"]',
+                '[class*="captcha-dy"][class*="wrap"]',
+                '[class*="captcha-dy"][class*="content"]',
+            ];
+            for (var wi = 0; wi < wrapSelectors.length; wi++) {
+                var wrapEl = document.querySelector(wrapSelectors[wi]);
+                if (wrapEl && visible(wrapEl)) {
+                    var wr = wrapEl.getBoundingClientRect();
+                    if (wr.width * wr.height >= MIN_AREA) {
+                        console.log('[captcha] fallback to wrap: ' + wrapSelectors[wi] + ' size=' + Math.round(wr.width) + 'x' + Math.round(wr.height));
+                        return wrapEl;
+                    }
+                }
+            }
+            return null;
+        }
+
+        candidates.sort(function(a, b) { return b.area - a.area; });
+        var best = candidates[0];
+        console.log('[captcha] selected container: ' + best.w + 'x' + best.h + ' area=' + Math.round(best.area));
+        console.log('[captcha] tag=' + best.el.tagName + ' class=' + (best.el.className || '').substring(0, 80));
+        console.log('[captcha] bg=' + window.getComputedStyle(best.el).backgroundImage.substring(0, 100));
+
+        var _dbgAll = best.el.querySelectorAll('*');
+        for (var di = 0; di < Math.min(_dbgAll.length, 20); di++) {
+            var de = _dbgAll[di];
+            var dr = de.getBoundingClientRect();
+            if (dr.width * dr.height < 500) continue;
+            var dbgBg = '';
+            try { dbgBg = window.getComputedStyle(de).backgroundImage.substring(0, 80); } catch(e) {}
+            var dbgSrc = '';
+            if (de.tagName === 'IMG') dbgSrc = ' src=' + (de.src || '').substring(0, 60);
+            if (de.tagName === 'CANVAS') dbgSrc = ' canvas=' + de.width + 'x' + de.height;
+            console.log('[captcha-dbg] ' + de.tagName + '.' + (de.className||'').substring(0,30) + ' ' + Math.round(dr.width) + 'x' + Math.round(dr.height) + dbgSrc + ' bg=' + dbgBg);
+        }
+
+        return best.el;
+    }
+
+    function captureElementAsBase64(el) {
+        try {
+            if (el.tagName === 'CANVAS') {
+                return el.toDataURL('image/png');
+            }
+            if (el.tagName === 'IMG') {
+                var c = document.createElement('canvas');
+                c.width = el.naturalWidth || el.width || 300;
+                c.height = el.naturalHeight || el.height || 200;
+                var ctx = c.getContext('2d');
+                ctx.drawImage(el, 0, 0);
+                return c.toDataURL('image/png');
+            }
+
+            var allImgChildren = el.querySelectorAll('img');
+            for (var mi = 0; mi < allImgChildren.length; mi++) {
+                var mimg = allImgChildren[mi];
+                if (!visible(mimg)) continue;
+                var mw = mimg.naturalWidth || mimg.width || 0;
+                var mh = mimg.naturalHeight || mimg.height || 0;
+                if (mw * mh >= 10000) {
+                    console.log('[captcha] using child img for capture, size=' + mw + 'x' + mh);
+                    var ic = document.createElement('canvas');
+                    ic.width = mw;
+                    ic.height = mh;
+                    var ictx = ic.getContext('2d');
+                    ictx.drawImage(mimg, 0, 0);
+                    return ic.toDataURL('image/png');
+                }
+            }
+
+            var canvasChild = el.querySelector('canvas');
+            if (canvasChild && visible(canvasChild)) {
+                console.log('[captcha] using child canvas for capture');
+                return canvasChild.toDataURL('image/png');
+            }
+
+            var bgUrl = null;
+            var computedBg = window.getComputedStyle(el).backgroundImage;
+            if (computedBg && computedBg !== 'none' && computedBg.indexOf('url(') !== -1) {
+                bgUrl = computedBg.replace(/url\(["']?/, '').replace(/["']?\)$/, '');
+                console.log('[captcha] found css background-image, url=' + bgUrl.substring(0, 80));
+            }
+            if (!bgUrl) {
+                var _walkEl = el;
+                for (var bi = 0; bi < 10 && _walkEl; bi++) {
+                    var parentBg = window.getComputedStyle(_walkEl).backgroundImage;
+                    if (parentBg && parentBg !== 'none' && parentBg.indexOf('url(') !== -1) {
+                        bgUrl = parentBg.replace(/url\(["']?/, '').replace(/["']?\)$/, '');
+                        console.log('[captcha] found bg on ancestor level ' + bi + ', url=' + bgUrl.substring(0, 80));
+                        break;
+                    }
+                    _walkEl = _walkEl.parentElement;
+                }
+            }
+
+            if (bgUrl) {
+                return new Promise(function(resolve) {
+                    var bgImg = new Image();
+                    bgImg.crossOrigin = 'anonymous';
+                    bgImg.onload = function() {
+                        console.log('[captcha] bg image loaded, size=' + bgImg.naturalWidth + 'x' + bgImg.naturalHeight);
+                        var bc = document.createElement('canvas');
+                        bc.width = bgImg.naturalWidth || bgImg.width || 330;
+                        bc.height = bgImg.naturalHeight || bgImg.height || 236;
+                        var bctx = bc.getContext('2d');
+                        bctx.drawImage(bgImg, 0, 0);
+                        resolve(bc.toDataURL('image/png'));
+                    };
+                    bgImg.onerror = function() { resolve(null); };
+                    bgImg.src = bgUrl;
+                });
+            }
+
+            var rect = el.getBoundingClientRect();
+            var w = Math.floor(rect.width * window.devicePixelRatio);
+            var h = Math.floor(rect.height * window.devicePixelRatio);
+
+            var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            svg.setAttribute('width', w);
+            svg.setAttribute('height', h);
+
+            var fo = document.createElementNS('http://www.w3.org/2000/svg', 'foreignObject');
+            fo.setAttribute('width', w);
+            fo.setAttribute('height', h);
+
+            var clone = el.cloneNode(true);
+            var allStyles = window.getComputedStyle(el);
+            var styleStr = '';
+            for (var si = 0; si < allStyles.length; si++) {
+                var prop = allStyles[si];
+                styleStr += prop + ':' + allStyles.getPropertyValue(prop) + ';';
+            }
+            clone.setAttribute('style', styleStr);
+
+            fo.appendChild(clone);
+            svg.appendChild(fo);
+
+            var svgData = new XMLSerializer().serializeToString(svg);
+            var svgBase64 = btoa(unescape(encodeURIComponent(svgData)));
+            var dataUrl = 'data:image/svg+xml;base64,' + svgBase64;
+
+            var imgForDraw = new Image();
+            imgForDraw.src = dataUrl;
+
+            return new Promise(function(resolve) {
+                imgForDraw.onload = function() {
+                    var fc = document.createElement('canvas');
+                    fc.width = w;
+                    fc.height = h;
+                    var fctx = fc.getContext('2d');
+                    fctx.drawImage(imgForDraw, 0, 0);
+                    resolve(fc.toDataURL('image/png'));
+                };
+                imgForDraw.onerror = function() { resolve(null); };
+            });
+
+        } catch(e) {
+            console.error('[captcha] capture error:', e);
+            return null;
+        }
+    }
+
+    function dispatchClickAt(el, relX, relY, label) {
+        var rect = el.getBoundingClientRect();
+        var clientX = rect.left + relX;
+        var clientY = rect.top + relY;
+
+        var evtWin = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        var opts = { bubbles: true, cancelable: true, view: evtWin, clientX: clientX, clientY: clientY,
+            screenX: clientX + evtWin.screenX, screenY: clientY + evtWin.screenY,
+            button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+
+        el.dispatchEvent(new PointerEvent('pointerdown', opts));
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        el.dispatchEvent(new PointerEvent('pointerup', opts));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+        console.log('[captcha] clicked @ (' + Math.round(clientX) + ',' + Math.round(clientY) + ')');
+
+        showClickMarker(clientX, clientY, label || '');
+    }
+
+    var _clickMarkers = [];
+    function clearClickMarkers() {
+        for (var mi = 0; mi < _clickMarkers.length; mi++) {
+            if (_clickMarkers[mi] && _clickMarkers[mi].parentNode) {
+                _clickMarkers[mi].parentNode.removeChild(_clickMarkers[mi]);
+            }
+        }
+        _clickMarkers = [];
+    }
+
+    function showClickMarker(x, y, label) {
+        try {
+            var hostDoc = document;
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow.document) {
+                hostDoc = unsafeWindow.document;
+            }
+            var marker = hostDoc.createElement('div');
+            marker.style.cssText = 'position:fixed;left:' + (x - 18) + 'px;top:' + (y - 18) +
+                'px;width:36px;height:36px;border-radius:50%;border:3px solid #ff0000;' +
+                'background:rgba(255,0,0,0.25);pointer-events:none;z-index:2147483647;' +
+                'box-shadow:0 0 8px rgba(255,0,0,0.8);display:flex;align-items:center;justify-content:center;' +
+                'font-size:14px;font-weight:bold;color:#ff0000;font-family:monospace;';
+            marker.textContent = label || '';
+            hostDoc.body.appendChild(marker);
+            _clickMarkers.push(marker);
+
+            setTimeout(function() {
+                if (marker.parentNode) marker.parentNode.removeChild(marker);
+                var idx = _clickMarkers.indexOf(marker);
+                if (idx > -1) _clickMarkers.splice(idx, 1);
+            }, 700);
+        } catch(e) {
+            console.error('[captcha] marker error:', e);
+        }
+    }
+
+    function findCaptchaPromptElement() {
+        var selectors = [
+            '.tencent-captcha-dy__header-text',
+            '.tencent-captcha-dy__header-title-wrap .tencent-captcha-dy__header-text',
+            "div[class*='tencent-captcha'] div[class*='header-text']",
+            '[aria-label]',
+        ];
+        for (var i = 0; i < selectors.length; i++) {
+            var el = document.querySelector(selectors[i]);
+            if (!el || !visible(el)) continue;
+            var text = getCaptchaPromptText(el);
+            if (!isPointClickPrompt(text)) continue;
+            var chars = extractCaptchaChars(text);
+            if (chars.length >= 3) {
+                return { selector: selectors[i], text: text, chars: chars };
+            }
+        }
+        return null;
+    }
+
+    function findCaptchaBgElementDirect() {
+        var selectors = [
+            '#slideBg',
+            '.tencent-captcha-dy__verify-bg-img',
+            '.tencent-captcha-dy__bg-img',
+            '[class*="verify-bg"]',
+            '[class*="bg-img"]',
+            '.tencent-captcha-dy__image-area'
+        ];
+        for (var i = 0; i < selectors.length; i++) {
+            var els = document.querySelectorAll(selectors[i]);
+            for (var j = 0; j < els.length; j++) {
+                var el = els[j];
+                if (visible(el) && captchaBgUrlFrom(el)) return el;
+            }
+        }
+        return null;
+    }
+
+    async function handleCaptchaDirectInPage(chars) {
+        var autoClick = CAPTCHA_CFG.AUTO_CAPTCHA_CLICK;
+        var autoConfirm = CAPTCHA_CFG.AUTO_CAPTCHA_CONFIRM;
+        if (!autoClick) {
+            console.log('[captcha-direct-page] auto captcha click disabled');
+            return;
+        }
+        if (rushState === 'solving') return;
+        rushState = 'solving';
+        var payloadText = chars.join('');
+        try {
+            var bgEl = findCaptchaBgElementDirect();
+            if (!bgEl) throw new Error('no captcha background element');
+            var bgUrl = captchaBgUrlFrom(bgEl);
+            if (!bgUrl) throw new Error('no captcha background url');
+            console.log('[captcha-direct-page] bg:', bgUrl.substring(0, 120));
+            var resp = await serverRequest('POST', '/captcha_direct_url', {
+                url: bgUrl,
+                text: payloadText,
+                remark: payloadText,
+                ts: Date.now(),
+                source: 'glm-coding-helper-page-direct'
+            });
+            var result = resp && resp.result;
+            if (!result || !result.success || !Array.isArray(result.click_coords)) {
+                throw new Error('bad direct result: ' + JSON.stringify(resp).substring(0, 180));
+            }
+            var rect = bgEl.getBoundingClientRect();
+            console.log('[captcha-direct-page] click result:', JSON.stringify(result).substring(0, 260));
+            for (var i = 0; i < result.click_coords.length; i++) {
+                var c = result.click_coords[i];
+                var nx = Number(c.nx);
+                var ny = Number(c.ny);
+                if (!Number.isFinite(nx) && Number.isFinite(Number(c.rel_x))) nx = Number(c.rel_x) / rect.width;
+                if (!Number.isFinite(ny) && Number.isFinite(Number(c.rel_y))) ny = Number(c.rel_y) / rect.height;
+                if (!Number.isFinite(nx) || !Number.isFinite(ny)) continue;
+                dispatchClickAt(bgEl, nx * rect.width, ny * rect.height, c.char || String(i + 1));
+                await new Promise(function(r) { setTimeout(r, 100); });
+            }
+            await new Promise(function(r) { setTimeout(r, 150); });
+            if (autoConfirm) {
+                findAndClickConfirm();
+            } else {
+                console.log('[captcha-direct-page] captcha confirm is disabled; waiting for manual confirm');
+            }
+        } catch (e) {
+            console.error('[captcha-direct-page] error:', e);
+            captchaSent = false;
+            lastCaptchaText = '';
+        } finally {
+            rushState = 'idle';
+        }
+    }
+
+    async function checkCaptchaPrompt() {
+        if (rushState === 'solving') return;
+
+        var found = findCaptchaPromptElement();
+        if (!found) { captchaSent = false; return; }
+
+        var payloadText = found.chars.join('');
+        if (!payloadText) { captchaSent = false; return; }
+
+        if (payloadText !== lastCaptchaText) {
+            lastCaptchaText = payloadText;
+            captchaSent = false;
+            console.log('[captcha] sel:', found.selector);
+            console.log('[captcha] raw:', found.text);
+            console.log('[captcha] prompt:', payloadText);
+        }
+
+        if (!captchaSent) {
+            captchaSent = true;
+            console.log('[captcha] page direct solver:', payloadText);
+            handleCaptchaDirectInPage(found.chars).catch(function(e) { console.error('[captcha-direct-page] unhandled:', e); });
+            return;
+        }
+    }
+
+    setInterval(checkCaptchaPrompt, 200);
+
+    // ── 测试模式 ──────────────────────────────────────────────────────────────
+    if (CFG.TEST_MODE) {
+        (function() {
+            var _tp = null, _tpTimer = null;
+            function tpCSS() {
+                if (document.getElementById('glm-tps')) return;
+                var s = document.createElement('style'); s.id = 'glm-tps';
+                s.textContent = '#glm-tp{position:fixed;bottom:60px;right:16px;z-index:2147483646;background:#fff;border:1px solid #d9d9d9;border-radius:10px;padding:12px 16px;font:13px/1.5 system-ui,sans-serif;color:#333;box-shadow:0 4px 20px rgba(0,0,0,.15);width:270px;transition:all .3s}#glm-tp .tph{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #f0f0f0}#glm-tp .tph b{font-size:14px}#glm-tp .tps{font-size:12px;padding:2px 8px;border-radius:10px;white-space:nowrap}#glm-tp .tps.ok{background:#f6ffed;color:#52c41a}#glm-tp .tps.err{background:#fff2f0;color:#ff4d4f}#glm-tp .tps.unk{background:#fafafa;color:#999}#glm-tp .tpr{font-size:12px;color:#555;margin-bottom:6px;min-height:18px}#glm-tp .tpb{display:flex;gap:6px;flex-wrap:wrap}#glm-tp .tpb button{padding:4px 10px;border:1px solid #d9d9d9;background:#fff;border-radius:4px;cursor:pointer;font-size:11px;transition:.15s}#glm-tp .tpb button:hover{border-color:#40a9ff;color:#40a9ff}#glm-tp .tpb button:disabled{opacity:.5;cursor:not-allowed}#glm-tp .tpl{font-size:11px;color:#888;margin-top:6px;padding-top:6px;border-top:1px solid #f0f0f0;word-break:break-all}';
+                document.head.appendChild(s);
+            }
+            function tpRender() {
+                tpCSS();
+                if (_tp) return;
+                _tp = document.createElement('div'); _tp.id = 'glm-tp';
+                _tp.innerHTML = '<div class="tph"><b>🧪 测试面板</b><span class="tps unk" id="tps">检测中...</span></div><div class="tpr" id="tpr">后端状态: 检测中...</div><div class="tpb"><button id="tp-ping">🏓 测试连接</button><button id="tp-ocr">🔍 测试OCR</button><button id="tp-confirm">✅ 测试确认</button></div><div class="tpl" id="tpl"></div>';
+                document.body.appendChild(_tp);
+                document.getElementById('tp-ping').onclick = tpPing;
+                document.getElementById('tp-ocr').onclick = tpOcr;
+                document.getElementById('tp-confirm').onclick = tpConfirm;
+                _tpTimer = setInterval(tpPing, 15000);
+                setTimeout(tpPing, 300);
+            }
+            function tpSetStatus(ok, msg) {
+                var s = document.getElementById('tps');
+                var r = document.getElementById('tpr');
+                if (!s || !r) return;
+                s.className = 'tps ' + (ok === true ? 'ok' : ok === false ? 'err' : 'unk');
+                s.textContent = ok === true ? '✓ 在线' : ok === false ? '✗ 离线' : '...';
+                r.textContent = msg || '后端状态: ' + (ok === true ? '正常' : ok === false ? '离线' : '检测中');
+            }
+            function tpLog(msg) {
+                var l = document.getElementById('tpl');
+                if (l) l.textContent = '📋 ' + msg;
+            }
+            async function tpPing() {
+                try {
+                    tpSetStatus(null, '后端状态: 检测中...');
+                    var resp = await serverRequest('GET', '/test');
+                    if (resp && resp.status === 'ok') {
+                        var info = '✓ ' + (resp.backend.ocr_mode || '?') + ' | 识别: ' + (resp.recognition.total || 0) + '次';
+                        if (resp.recognition && resp.recognition.last_result) {
+                            var last = resp.recognition.last_result.result || {};
+                            info += ' | 上次: ' + (last.pred_text || '?') + ' (' + ((last.confidence || 0) * 100).toFixed(0) + '%)';
+                        }
+                        tpSetStatus(true, '后端状态: ' + info);
+                    } else {
+                        tpSetStatus(false, '后端返回: 异常');
+                    }
+                } catch (e) {
+                    tpSetStatus(false, '连接失败: ' + (e.message || e));
+                }
+            }
+            async function tpOcr() {
+                tpLog('正在检测验证码...');
+                try {
+                    var found = findCaptchaPromptElement();
+                    if (!found) { tpLog('未检测到验证码弹窗'); return; }
+                    tpLog('发现验证码: ' + found.text);
+                    var bgEl = findCaptchaBgElementDirect();
+                    if (!bgEl) { tpLog('未找到验证码背景图'); return; }
+                    var bgUrl = captchaBgUrlFrom(bgEl);
+                    if (!bgUrl) { tpLog('未获取到背景图URL'); return; }
+                    tpLog('正在下载验证码图片...');
+                    var image = await fetchCaptchaImageDirect(bgUrl);
+                    tpLog('正在发送识别请求...');
+                    var resp = await serverRequest('POST', '/captcha_direct', {
+                        image: image,
+                        text: found.text,
+                        remark: found.text,
+                        ts: Date.now(),
+                        source: 'glm-test-mode'
+                    });
+                    var result = resp && resp.result;
+                    if (result && result.success && Array.isArray(result.click_coords)) {
+                        var pt = result.pred_text || '?';
+                        var conf = ((result.confidence || 0) * 100).toFixed(0);
+                        tpLog('✓ 识别成功: ' + pt + ' (' + conf + '%) 坐标: ' + result.click_coords.length + '个');
+                        if (result.click_coords.length > 0) {
+                            bgEl = findCaptchaBgElementDirect();
+                            if (bgEl) {
+                                var rect = bgEl.getBoundingClientRect();
+                                for (var i = 0; i < result.click_coords.length; i++) {
+                                    var c = result.click_coords[i];
+                                    var nx = Number(c.nx) || (Number(c.rel_x) / rect.width);
+                                    var ny = Number(c.ny) || (Number(c.rel_y) / rect.height);
+                                    if (Number.isFinite(nx) && Number.isFinite(ny)) {
+                                        dispatchClickAt(bgEl, nx * rect.width, ny * rect.height, c.char || String(i + 1));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        tpLog('✗ 识别失败: ' + JSON.stringify(resp).substring(0, 160));
+                    }
+                } catch (e) {
+                    tpLog('✗ 识别异常: ' + (e.message || e));
+                }
+            }
+            function tpConfirm() {
+                try {
+                    var ok = findAndClickConfirm();
+                    tpLog(ok ? '✓ 已点击确认按钮' : '✗ 未找到确认按钮');
+                } catch (e) {
+                    tpLog('✗ 确认异常: ' + (e.message || e));
+                }
+            }
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', tpRender);
+            } else {
+                tpRender();
+            }
+        })();
+    }
+})();
+
+

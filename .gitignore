@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Temp / runtime
+temp/
+func_ret/
+locks/
+
+# PaddleX cache
+.paddlex_cache_cpu/
+.paddlex_cache/
+
+# PyInstaller artifacts
+*.spec
+
+# Large model files (download via setup.ps1)
+*.safetensors

@@ -1,0 +1,25 @@
+{
+    "model_type": "pp_ocrv5_server_rec",
+    "backbone_config": {
+        "model_type": "hgnet_v2",
+        "arch": "L",
+        "return_idx": [0, 1, 2, 3],
+        "freeze_stem_only": true,
+        "freeze_at": 0,
+        "freeze_norm": true,
+        "lr_mult_list": [1.0, 1.0, 1.0, 1.0, 1.0],
+        "out_features": ["stage1", "stage2", "stage3", "stage4"],
+        "stage_downsample": [true, true, true, true],
+        "stem_strides": [2, 1, 1, 1, 1],
+        "stage_downsample_strides": [[2, 1], [1, 2], [2, 1], [2, 1]]
+    },
+    "hidden_act": "silu",
+    "hidden_size": 120,
+    "mlp_ratio": 2.0,
+    "depth": 2,
+    "head_out_channels": 18385,
+    "conv_kernel_size": [1, 3],
+    "qkv_bias": true,
+    "num_attention_heads": 8,
+    "attention_dropout": 0.0
+}
