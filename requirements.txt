@@ -1,0 +1,11 @@
+# GLM Coding Helper Lite - Yi Lai
+# Yong tu: python -m pip install -r requirements.txt --only-binary :all:
+# Ru guo wang luo man, ke jia -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+numpy>=1.21,<2
+pillow>=10.0
+requests>=2.28
+opencv-python
+paddlepaddle>=2.6,<3
+paddleocr>=2.8
+ultralytics>=8.0

@@ -6,7 +6,7 @@ import os
 import queue
 import sys
 import time
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Pipe
 from pathlib import Path
 from threading import Lock
 
@@ -66,18 +66,18 @@ def predict_with_candidate_scores(recognizer, path: str, prompt: list[str]) -> d
     }
 
 
-def recognizer_worker(req_q: Queue, resp_q: Queue, worker_id: int, model_name: str) -> None:
+def recognizer_worker(req_q: Queue, ready_q: Queue, worker_id: int, model_name: str) -> None:
     try:
         configure_env()
         from paddleocr import TextRecognition
 
         recognizer = TextRecognition(model_name=model_name, device="cpu", engine=ENGINE)
-        resp_q.put({"type": "ready", "worker": worker_id})
+        ready_q.put({"type": "ready", "worker": worker_id})
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
         try:
-            resp_q.put({"type": "error", "worker": worker_id, "error": str(exc), "traceback": tb})
+            ready_q.put({"type": "error", "worker": worker_id, "error": str(exc), "traceback": tb})
         except Exception:
             pass
         sys.stderr.write(f"[worker-{worker_id}] INIT FAILED:\n{tb}\n")
@@ -87,7 +87,7 @@ def recognizer_worker(req_q: Queue, resp_q: Queue, worker_id: int, model_name: s
         item = req_q.get()
         if item is None:
             break
-        req_id, idx, path, prompt = item
+        req_id, idx, path, prompt, conn = item
         try:
             started = time.perf_counter()
             if CONSTRAINED_DECODE and prompt:
@@ -99,18 +99,18 @@ def recognizer_worker(req_q: Queue, resp_q: Queue, worker_id: int, model_name: s
                 score = float(obj.get("rec_score", 0.0) or 0.0) if isinstance(obj, dict) else 0.0
                 row = {"text": text, "char": first_cjk(text), "score": score}
             elapsed_ms = (time.perf_counter() - started) * 1000.0
-            resp_q.put(
-                {
-                    "type": "result",
-                    "req_id": req_id,
-                    "idx": idx,
-                    **row,
-                    "elapsed_ms": elapsed_ms,
-                    "worker": worker_id,
-                }
-            )
+            msg = {
+                "type": "result",
+                "req_id": req_id,
+                "idx": idx,
+                **row,
+                "elapsed_ms": elapsed_ms,
+                "worker": worker_id,
+            }
+            conn.send(msg)
         except Exception as exc:
-            resp_q.put({"type": "result", "req_id": req_id, "idx": idx, "error": str(exc), "worker": worker_id})
+            msg = {"type": "result", "req_id": req_id, "idx": idx, "error": str(exc), "worker": worker_id}
+            conn.send(msg)
     recognizer.close()
 
 
@@ -227,9 +227,9 @@ class CpuOcrPool:
     def __init__(self, workers: int, model_name: str) -> None:
         self.model_name = model_name
         self.req_q: Queue = Queue()
-        self.resp_q: Queue = Queue()
+        self._ready_q: Queue = Queue()
         self.procs = [
-            Process(target=recognizer_worker, args=(self.req_q, self.resp_q, idx, model_name))
+            Process(target=recognizer_worker, args=(self.req_q, self._ready_q, idx, model_name))
             for idx in range(workers)
         ]
         for i, proc in enumerate(self.procs):
@@ -248,7 +248,7 @@ class CpuOcrPool:
                     f"Check the worker's stderr for details."
                 )
             try:
-                msg = self.resp_q.get(timeout=min(remaining, 5.0))
+                msg = self._ready_q.get(timeout=min(remaining, 5.0))
             except queue.Empty:
                 continue
             if msg.get("type") == "ready":
@@ -257,25 +257,34 @@ class CpuOcrPool:
                 raise RuntimeError(
                     f"Worker {msg.get('worker')} init failed:\n"
                     f"error: {msg.get('error')}\n"
-                    f"traceback:\n{msg.get('traceback')}"
-                )
-
+                    f"traceback:\n{msg.get('traceback')}")
     def predict(self, req_id: int, paths: list[str], prompt: list[str], timeout: float = 30.0) -> list[dict]:
+        from multiprocessing.connection import wait
+
+        pipes: dict[int, Connection] = {}
         for idx, path in enumerate(paths):
-            self.req_q.put((req_id, idx, path, prompt))
+            parent_conn, child_conn = Pipe(duplex=False)
+            pipes[idx] = parent_conn
+            self.req_q.put((req_id, idx, path, prompt, child_conn))
 
         deadline = time.perf_counter() + timeout
         results: list[dict] = []
-        while len(results) < len(paths):
+        while pipes:
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
+                for p in pipes.values():
+                    p.close()
                 raise TimeoutError("PP-OCR CPU pool timeout")
-            try:
-                msg = self.resp_q.get(timeout=remaining)
-            except queue.Empty as exc:
-                raise TimeoutError("PP-OCR CPU pool timeout") from exc
-            if msg.get("type") == "result" and msg.get("req_id") == req_id:
-                results.append(msg)
+            ready = wait(list(pipes.values()), timeout=remaining)
+            if not ready:
+                raise TimeoutError("PP-OCR CPU pool timeout")
+            for conn in ready:
+                idx = next(i for i, c in pipes.items() if c is conn)
+                msg = conn.recv()
+                conn.close()
+                del pipes[idx]
+                if msg.get("type") == "result" and msg.get("req_id") == req_id:
+                    results.append(msg)
 
         results.sort(key=lambda item: int(item["idx"]))
         for item in results:

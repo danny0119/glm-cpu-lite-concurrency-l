@@ -2,7 +2,7 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 
-echo === GLM Coding Helper Lite ===
+echo === GLM Coding Helper Lite (全环境打包版) ===
 echo.
 
 REM ---- 1. Config check -------------------------------------------------
@@ -16,29 +16,28 @@ if exist "config.json" (
 )
 echo.
 
-REM ---- 2. OCR model cache check ----------------------------------------
-if exist ".paddlex_cache_cpu\official_models" (
-    echo [OK] OCR model cache found (no download needed)
-) else (
-    echo [INFO] OCR model cache not bundled
-    echo   first OCR request will download ~100MB model
+REM ---- 2. Check bundled EXE --------------------------------------------
+if not exist "%~dp0dist\GLM-Lite\GLM-Lite.exe" (
+    echo [FAIL] GLM-Lite.exe not found in dist\GLM-Lite\
+    echo   Please re-extract the full package.
+    pause
+    exit /b 1
 )
+echo [OK] Self-contained EXE found (no Python/env needed)
 echo.
 
-REM ---- 3. Environment check --------------------------------------------
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup.ps1"
-if %errorlevel% neq 0 ( pause & exit /b )
-
-REM ---- 4. Start backend ------------------------------------------------
+REM ---- 3. Start backend (self-contained EXE) ---------------------------
 echo.
 echo Starting backend server...
 echo   Running on http://localhost:8888
 echo.
 echo To stop: close this window or press Ctrl+C
 echo.
-"%~dp0venv\Scripts\python.exe" -u "%~dp0glm-lite.py"
+start "GLM-Lite Backend" /B "%~dp0dist\GLM-Lite\GLM-Lite.exe"
 
-if %errorlevel% neq 0 (
-    echo Backend exited abnormally (code: %errorlevel%)
-    pause
-)
+REM Wait briefly then show status
+timeout /t 5 /nobreak >nul
+echo.
+echo Backend started. Check http://localhost:8888/health
+echo.
+pause

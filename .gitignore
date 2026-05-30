@@ -39,3 +39,13 @@ locks/
 
 # Large model files (download via setup.ps1)
 *.safetensors
+
+# Runtime artifacts
+server.pid
+logs/
+
+# Temp folders
+3.0/
+
+# ZIP distribution package
+*.zip

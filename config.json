@@ -1,7 +1,7 @@
 ﻿{
-    "workers":  14,
+    "workers":  8,
     "port":  8888,
-    "ocr_workers":  4,
+    "ocr_workers":  6,
     "yolo_imgsz":  448,
-    "stagger_delay":  3
+    "stagger_delay":  0.5
 }

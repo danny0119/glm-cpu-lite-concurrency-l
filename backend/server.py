@@ -3,11 +3,11 @@ GLM Coding Helper Lite — 并发验证码识别服务
 - 自动检测 CPU + RAM，计算最佳 Worker 池大小
 - 低配机器自动降级，避免内存耗尽
 - ThreadingHTTPServer 并发处理 HTTP
-- WorkerPool 多子进程轮询分发
+- WorkerPool 空闲分发（只向空闲 worker 发请求）
 - 支持 config.json 自定义参数
 """
 
-import argparse, base64, ctypes, io, json, os, re, socket, subprocess, sys, threading, time, urllib.request
+import argparse, base64, ctypes, io, json, os, queue, re, socket, subprocess, sys, threading, time, urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -28,28 +28,26 @@ def _entry_prefix():
         return [sys.executable]
     return [sys.executable, "-u", str(ROOT / "glm-lite.py")]
 
-# ── 配置加载 ────────────────────────────────────────────────────────────────
+
 def load_config():
-    """读取 config.json（如果存在），否则返回 None"""
-    paths = [CONFIG_PATH]
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        paths.append(Path(sys._MEIPASS) / "config.json")
-    for p in paths:
-        if p.exists():
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                return cfg
-            except Exception as e:
-                print(f"[warn] {p} parse failed: {e}, using auto-detect")
-    return None
+    """读取 config.json，返回 dict 或 None"""
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        raw = CONFIG_PATH.read_bytes()
+        if raw[:3] == b'\xef\xbb\xbf':
+            raw = raw[3:]
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[lite] config.json parse error: {e}")
+        return None
 
 
-# ── CPU / RAM 检测 ────────────────────────────────────────────────
 def _get_total_ram_mb() -> int:
-    """使用 Windows API 获取物理内存总量（MB），零依赖"""
+    """Windows: 通过 Kernel32.GlobalMemoryStatusEx 获取物理内存总量（MB）"""
     try:
         kernel32 = ctypes.windll.kernel32
+
         class MEMORYSTATUSEX(ctypes.Structure):
             _fields_ = [
                 ("dwLength", ctypes.c_ulong),
@@ -62,13 +60,15 @@ def _get_total_ram_mb() -> int:
                 ("ullAvailVirtual", ctypes.c_ulonglong),
                 ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
             ]
-        mem = MEMORYSTATUSEX()
-        mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-        if kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)):
-            return int(mem.ullTotalPhys // (1024 * 1024))
+
+        state = MEMORYSTATUSEX()
+        state.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if kernel32.GlobalMemoryStatusEx(ctypes.byref(state)):
+            return state.ullTotalPhys // (1024 * 1024)
     except Exception:
         pass
-    return 0  # 无法获取
+    return 0
+
 
 def detect_optimal():
     cpus = os.cpu_count() or 4
@@ -79,30 +79,37 @@ def detect_optimal():
     else:
         print(f"[lite] CPU: {cpus} cores  (RAM detection unavailable)")
 
-    # YOLO workers：每个 worker 约 200-300MB
+    # YOLO workers：每个 worker 约 200-300MB；空闲分发不再需要过度预分配
     if total_ram_mb > 0 and total_ram_mb < 4096:
-        workers = 1
-        print(f"[lite] low-memory mode: 1 YOLO worker")
+        workers = 2
+        print(f"[lite] low-memory mode: 2 YOLO workers")
     elif total_ram_mb > 0 and total_ram_mb < 8192:
-        workers = max(1, min(cpus // 4, 4))
+        workers = max(1, min(cpus // 4, 6))
         print(f"[lite] limited-memory mode: {workers} YOLO workers")
     else:
-        workers = max(2, min(cpus // 2 - 2, 16))
+        workers = max(2, min(cpus // 2, 10))
+        if total_ram_mb > 0 and total_ram_mb >= 65536:
+            workers = max(2, min(cpus // 2, 12))  # 大内存机器可以更多 YOLO
 
     tabs = max(4, min(workers * 2, 32))
     return workers, tabs, cpus, total_ram_mb
+
 
 def detect_ocr_workers(cpus: int, total_ram_mb: int) -> int:
     """OCR worker 数量：每个 paddle 进程约 500MB-1GB"""
     if total_ram_mb > 0 and total_ram_mb < 4096:
         return 1
     if total_ram_mb > 0 and total_ram_mb < 8192:
-        return 1
-    return max(1, min(cpus // 8, 6))
+        return 2
+    if total_ram_mb > 0 and total_ram_mb < 16384:
+        return 4
+    # ≥16GB RAM：可以开多一些
+    return max(2, min(cpus // 4, 8))
 
 
-# ── Worker 池 ──────────────────────────────────────────────────────────────
+# ── Worker 池（空闲分发） ────────────────────────────────────────────────────
 class WorkerPool:
+    """空闲分发 Worker 池：只向空闲 worker 发送请求，避免轮询排队"""
     def __init__(self, count, ocr_port=None, stagger_delay=3, yolo_imgsz=448):
         self.procs = []
         self.env = os.environ.copy()
@@ -111,37 +118,71 @@ class WorkerPool:
         self.env["YOLO_IMGSZ"] = str(yolo_imgsz)
         if ocr_port is not None:
             self.env["PPOCR_TCP_PORT"] = str(ocr_port)
+
+        # 空闲 worker 索引队列
+        self._idle_queue = queue.Queue()
+        self._pending = {}                # idx → [threading.Event, response_bytes]
+        self._pending_lock = threading.Lock()
+
         for i in range(count):
             p = subprocess.Popen(
                 _entry_prefix() + ["--worker"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, cwd=str(ROOT), env=self.env,
             )
+            # 后台：转发 stderr
             threading.Thread(target=self._drain, args=(p, i), daemon=True).start()
-            self.procs.append(p)
-            # 等待本 worker 发送 __READY__ 信号（YOLO 加载完毕）
+            # 先等待本 worker 发送 __READY__ 信号（YOLO 加载完毕），
+            # 再启动 _reader 线程，避免与主线程争抢 stdout
             ready = p.stdout.readline().strip()
             if ready != b"__READY__":
                 print(f"[w{i}] unexpected stdout: {ready}")
             else:
                 print(f"[w{i}] YOLO model warmed up")
+            # 后台：持续读取 stdout，填充 _pending（此时 __READY__ 已消费）
+            threading.Thread(target=self._reader, args=(p, i), daemon=True).start()
+            self.procs.append(p)
+            self._idle_queue.put(i)  # 初始都空闲
             if i < count - 1:
                 time.sleep(stagger_delay)  # 错峰启动，避免 CPU 撑爆
-        self.idx = 0
-        self.lock = threading.Lock()
-        print(f"[lite] WorkerPool: {count} workers  x  {cpus} threads")
+        print(f"[lite] WorkerPool: {count} workers (idle-dispatch)")
 
     def _drain(self, proc, i):
         for line in proc.stderr:
             sys.stderr.write(f"[w{i}] {line.decode(errors='replace')}")
 
-    def send(self, data: bytes) -> bytes:
-        with self.lock:
-            p = self.procs[self.idx % len(self.procs)]
-            self.idx += 1
+    def _reader(self, proc, i):
+        """持续读取 worker stdout，完成对应的 _pending 请求"""
+        for line in proc.stdout:
+            ev = None
+            with self._pending_lock:
+                entry = self._pending.get(i)
+                if entry is not None:
+                    entry[1] = line  # store response under lock
+                    ev = entry[0]
+            if ev is not None:
+                ev.set()  # notify send() — outside lock to avoid deadlock
+            self._idle_queue.put(i)  # worker 回归空闲池
+
+    def send(self, data: bytes, timeout: float = 30.0) -> bytes:
+        """取一个空闲 worker 发送请求，阻塞等待结果"""
+        idx = self._idle_queue.get()
+        p = self.procs[idx]
+        ev = threading.Event()
+        with self._pending_lock:
+            self._pending[idx] = [ev, None]
         p.stdin.write(data + b"\n")
         p.stdin.flush()
-        return p.stdout.readline()
+        if not ev.wait(timeout=timeout):
+            with self._pending_lock:
+                self._pending.pop(idx, None)
+            self._idle_queue.put(idx)  # 超时也归还，避免永久丢失
+            raise TimeoutError(f"Worker {idx} timeout")
+        with self._pending_lock:
+            resp = self._pending.pop(idx, [None, None])[1]
+        if resp is None:
+            raise RuntimeError(f"Worker {idx} returned no data")
+        return resp
 
 
 # ── HTTP Handler ────────────────────────────────────────────────────────────
@@ -163,15 +204,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self.send(400, {"error": "bad json"}); return
 
-        path = self.path
-        if path == "/health":
-            self.send(200, {"status": "ok", "workers": workers, "tabs": max_tabs})
-        elif path == "/captcha_direct":
+        # 优先从请求体 action 字段获取，否则从 URL 路径推断（兼容用户脚本旧格式）
+        action = data.get("action", "")
+        if not action:
+            if "direct_url" in self.path:
+                action = "direct_url"
+            elif "direct" in self.path:
+                action = "direct"
+
+        if action == "direct":
             self.handle_direct(data)
-        elif path == "/captcha_direct_url":
+        elif action == "direct_url":
             self.handle_direct_url(data)
         else:
-            self.send(404, {"error": "not found"})
+            self.send(400, {"error": f"unknown action: {action}"})
 
     def handle_direct(self, data):
         text = data.get("text", "").strip()
@@ -181,6 +227,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send(400, {"error": "missing text or image"}); return
 
         img_bytes = base64.b64decode(img_b64.split(",")[-1])
+        if not img_bytes:
+            self.send(400, {"error": "empty image"}); return
+
+        # 用 PIL 验证图片有效性
+        try:
+            from PIL import Image
+            Image.open(io.BytesIO(img_bytes)).verify()
+        except Exception:
+            self.send(400, {"error": "invalid image data"}); return
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         debug = ROOT / "logs" / "captcha"
         debug.mkdir(parents=True, exist_ok=True)
@@ -208,6 +264,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send(400, {"error": f"failed to download image: {e}"}); return
 
+        if not img_bytes:
+            self.send(400, {"error": "empty image from server"}); return
+
+        # 用 PIL 验证图片有效性（支持 PNG/JPEG 等常见格式）
+        try:
+            from PIL import Image
+            Image.open(io.BytesIO(img_bytes)).verify()
+        except Exception:
+            self.send(400, {"error": "invalid image data from server"}); return
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         debug = ROOT / "logs" / "captcha"
         debug.mkdir(parents=True, exist_ok=True)
@@ -229,15 +295,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(obj, ensure_ascii=False).encode())
 
     def log_message(self, fmt, *a):
-        pass
+        pass  # 禁用默认日志输出
 
 
+# ── HTTP 服务器 ─────────────────────────────────────────────────────────────
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    request_queue_size = 20  # 限制排队请求数，避免积压
     daemon_threads = True
-    allow_reuse_address = True
 
 
-# ── 启动 ────────────────────────────────────────────────────────────────────
 def main():
     global pool, workers, max_tabs, cpus
 
@@ -283,7 +349,7 @@ def main():
         yolo_imgsz    = 448
         print(f"[lite] auto-detect: {cpus} cores, OCR×{ocr_workers} → {workers} workers")
 
-    print(f"CPU: {cpus} logical  |  Workers: {workers}  |  推荐标签页: ≤{max_tabs}")
+    print(f"CPU: {cpus} logical  |  Workers: {workers}  |  OCR: ×{ocr_workers}  |  推荐标签页: ≤{max_tabs}")
 
     # 2. 启动共享 OCR Worker (TCP 模式)
     ocr_env = os.environ.copy()
@@ -348,7 +414,3 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         server.shutdown()
-
-
-if __name__ == "__main__":
-    main()
