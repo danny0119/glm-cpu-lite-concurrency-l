@@ -47,5 +47,8 @@ logs/
 # Temp folders
 3.0/
 
+# Upload helpers (may contain tokens)
+upload_release.py
+
 # ZIP distribution package
 *.zip
