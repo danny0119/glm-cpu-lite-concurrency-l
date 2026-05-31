@@ -29,6 +29,16 @@ Thumbs.db
 temp/
 func_ret/
 locks/
+server_stderr.log
+server_stdout.log
+ocr_stderr.log
+server.log
+l4_fix_smoke.log
+temp_hex.txt
+_t.py
+_test_run.py
+_check_deps.py
+bench_workerpool.py
 
 # PaddleX cache
 .paddlex_cache_cpu/

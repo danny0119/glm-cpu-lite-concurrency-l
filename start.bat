@@ -38,6 +38,18 @@ if exist "%~dp0venv\Scripts\python.exe" (
     echo.
     echo 关闭本窗口或 Ctrl+C 停止
     echo.
+
+    REM 检查端口是否被占用
+    netstat -ano | findstr ":8888 " | findstr LISTENING >nul 2>&1
+    if not errorlevel 1 (
+        echo [FAIL] 端口 8888 已被占用！
+        echo     可能是因为已经运行过一个后端实例。
+        echo     请先关闭已有的命令行窗口，再重新启动。
+        echo.
+        pause
+        exit /b 1
+    )
+
     "%~dp0venv\Scripts\python.exe" "%~dp0backend\server.py"
     pause
     exit /b 0

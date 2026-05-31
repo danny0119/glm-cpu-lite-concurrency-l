@@ -113,32 +113,77 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
                 ts: Date.now(),
                 source: 'tencent_iframe_direct',
             });
+            const url = DIRECT_OCR_URL;
+            // 优先用 fetch() —— 浏览器原生无连接数限制，12窗口同时发不排队
+            // 若 iframe CSP 阻止，再回退 GM_xmlhttpRequest
             return new Promise((resolve, reject) => {
-                if (typeof GM_xmlhttpRequest !== 'undefined') {
+                const doFetch = () => {
+                    fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body,
+                    }).then(r => r.json()).then(resolve).catch(() => {
+                        if (typeof GM_xmlhttpRequest !== 'undefined') {
+                            doGM();
+                        } else {
+                            reject(new Error('both fetch and GM_xmlhttpRequest failed'));
+                        }
+                    });
+                };
+                const doGM = () => {
                     GM_xmlhttpRequest({
                         method: 'POST',
-                        url: DIRECT_OCR_URL,
+                        url: url,
                         headers: { 'Content-Type': 'application/json' },
                         data: body,
                         onload: (res) => {
                             try { resolve(JSON.parse(res.responseText)); }
                             catch { reject(new Error('bad direct OCR JSON')); }
                         },
-                        onerror: () => {
-                            fetch(DIRECT_OCR_URL, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body,
-                            }).then(r => r.json()).then(resolve).catch(reject);
-                        },
+                        onerror: () => reject(new Error('GM_xmlhttpRequest failed')),
                     });
-                    return;
-                }
-                fetch(DIRECT_OCR_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body,
-                }).then(r => r.json()).then(resolve).catch(reject);
+                };
+                doFetch();
+            });
+        }
+
+        /** 将图片 URL 发给服务端下载并识别 —— 客户端零下载、零排队 */
+        function postDirectUrl(imgUrl, chars) {
+            const body = JSON.stringify({
+                url: imgUrl,
+                text: chars,
+                ts: Date.now(),
+                source: 'tencent_iframe_direct_url',
+            });
+            const url = 'http://127.0.0.1:8888/captcha_direct_url';
+            return new Promise((resolve, reject) => {
+                const doFetch = () => {
+                    fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body,
+                    }).then(r => r.json()).then(resolve).catch(() => {
+                        if (typeof GM_xmlhttpRequest !== 'undefined') {
+                            doGM();
+                        } else {
+                            reject(new Error('both fetch and GM_xmlhttpRequest failed'));
+                        }
+                    });
+                };
+                const doGM = () => {
+                    GM_xmlhttpRequest({
+                        method: 'POST',
+                        url: url,
+                        headers: { 'Content-Type': 'application/json' },
+                        data: body,
+                        onload: (res) => {
+                            try { resolve(JSON.parse(res.responseText)); }
+                            catch { reject(new Error('bad direct OCR JSON')); }
+                        },
+                        onerror: () => reject(new Error('GM_xmlhttpRequest failed')),
+                    });
+                };
+                doFetch();
             });
         }
 
@@ -199,8 +244,14 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
 
             lastBgUrl = bgUrl;
             log('capture ' + chars + ' from ' + bgUrl.slice(0, 90));
-            const dataUrl = await fetchImageDataUrl(bgUrl);
-            const response = await postDirect(dataUrl, chars);
+            // 优先发 URL 让服务端下载并识别 —— 客户端零下载、零排队
+            var response = await postDirectUrl(bgUrl, chars);
+            if (!response || !response.success) {
+                // CSP 阻止 fetch 时回退：客户端下载 base64 再发
+                log('postDirectUrl failed, fallback to postDirect');
+                const dataUrl = await fetchImageDataUrl(bgUrl);
+                response = await postDirect(dataUrl, chars);
+            }
             const result = response && response.result;
             if (!result || !result.success || !Array.isArray(result.click_coords)) {
                 log('direct OCR failed: ' + JSON.stringify(response).slice(0, 200));
@@ -1582,31 +1633,31 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
     function serverRequest(method, path, data) {
         return new Promise((resolve, reject) => {
             try {
-                if (typeof GM_xmlhttpRequest !== 'undefined') {
-                    GM_xmlhttpRequest({
-                        method: method,
-                        url: 'http://localhost:8888' + path,
-                        headers: { 'Content-Type': 'application/json' },
-                        data: data ? JSON.stringify(data) : undefined,
-                        onload: (r) => {
-                            try { resolve(JSON.parse(r.responseText)); }
-                            catch { resolve({ raw: r.responseText }); }
-                        },
-                        onerror: () => {
-                            fetch('http://localhost:8888' + path, {
-                                method: method,
-                                headers: { 'Content-Type': 'application/json' },
-                                body: data ? JSON.stringify(data) : undefined,
-                            }).then(r => r.json()).then(resolve).catch(reject);
-                        },
-                    });
-                } else {
-                    fetch('http://localhost:8888' + path, {
-                        method: method,
-                        headers: { 'Content-Type': 'application/json' },
-                        body: data ? JSON.stringify(data) : undefined,
-                    }).then(r => r.json()).then(resolve).catch(reject);
-                }
+                var url = 'http://localhost:8888' + path;
+                var body = data ? JSON.stringify(data) : undefined;
+                // 优先 fetch() —— 浏览器原生无连接数限制
+                fetch(url, {
+                    method: method,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: body,
+                }).then(function(r) { return r.json(); }).then(resolve).catch(function() {
+                    // CSP 限制时回退 GM_xmlhttpRequest
+                    if (typeof GM_xmlhttpRequest !== 'undefined') {
+                        GM_xmlhttpRequest({
+                            method: method,
+                            url: url,
+                            headers: { 'Content-Type': 'application/json' },
+                            data: body,
+                            onload: function(r) {
+                                try { resolve(JSON.parse(r.responseText)); }
+                                catch { resolve({ raw: r.responseText }); }
+                            },
+                            onerror: reject,
+                        });
+                    } else {
+                        reject(new Error('fetch failed'));
+                    }
+                });
             } catch (e) { reject(e); }
         });
     }
@@ -2162,5 +2213,4 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
         })();
     }
 })();
-
 

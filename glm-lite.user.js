@@ -78,23 +78,42 @@
 
   // ── 与后端通信 ───────────────────────────────────────────────────────
   function solveCaptcha(text, imageDataUrl) {
+    const body = JSON.stringify({ text, image: imageDataUrl });
+    const url = CONFIG.backendUrl + "/captcha_direct";
+    // 优先 fetch() —— 浏览器原生并发，多窗口互不阻塞
     return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: "POST",
-        url: CONFIG.backendUrl + "/captcha_direct",
-        headers: { "Content-Type": "application/json" },
-        data: JSON.stringify({ text, image: imageDataUrl }),
-        timeout: 30000,
-        onload: (r) => {
-          try {
-            const res = JSON.parse(r.responseText);
-            if (res.success) resolve(res.result);
-            else reject(new Error(res.error || "识别失败"));
-          } catch (e) { reject(e); }
-        },
-        onerror: reject,
-        ontimeout: () => reject(new Error("后端超时")),
-      });
+      const doFetch = () => {
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        }).then(r => r.json()).then(res => {
+          if (res.success) resolve(res.result);
+          else reject(new Error(res.error || "识别失败"));
+        }).catch(() => {
+          if (typeof GM_xmlhttpRequest !== 'undefined') doGM();
+          else reject(new Error("both fetch and GM_xmlhttpRequest failed"));
+        });
+      };
+      const doGM = () => {
+        GM_xmlhttpRequest({
+          method: "POST",
+          url: url,
+          headers: { "Content-Type": "application/json" },
+          data: body,
+          timeout: 30000,
+          onload: (r) => {
+            try {
+              const res = JSON.parse(r.responseText);
+              if (res.success) resolve(res.result);
+              else reject(new Error(res.error || "识别失败"));
+            } catch (e) { reject(e); }
+          },
+          onerror: reject,
+          ontimeout: () => reject(new Error("后端超时")),
+        });
+      };
+      doFetch();
     });
   }
 
@@ -213,24 +232,15 @@
       if (now - lastCheck < checkInterval) return;
 
       // 检查后端健康状态
-      GM_xmlhttpRequest({
-        method: "GET",
-        url: CONFIG.backendUrl + "/health",
-        timeout: 3000,
-        onload: (r) => {
-          try {
-            const res = JSON.parse(r.responseText);
-            if (res.status === "ok") {
-              showBadge("ok", `🧠 在线 (${res.workers}W)`);
-              // 检测到验证码时自动识别
-              autoSolve();
-            }
-          } catch (e) { /* ignore */ }
-        },
-        onerror: () => {
-          showBadge("err", "🧠 离线");
-        },
-      });
+      fetch(CONFIG.backendUrl + "/health", { method: "GET" })
+        .then(r => r.json())
+        .then(res => {
+          if (res.status === "ok") {
+            showBadge("ok", `🧠 在线 (${res.workers}W)`);
+            autoSolve();
+          }
+        })
+        .catch(() => showBadge("err", "🧠 离线"));
       lastCheck = now;
     }, checkInterval);
   }

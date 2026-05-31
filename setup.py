@@ -108,6 +108,9 @@ def install_deps(venv_py: Path):
         "paddlepaddle>=2.6,<3",
         "paddleocr>=2.8",
         "ultralytics>=8.0",
+        "fastapi>=0.100",
+        "uvicorn>=0.22",
+        "psutil>=5.9",
     ]
 
     for dep in deps:
@@ -207,6 +210,9 @@ def main():
         ("numpy", "NumPy"),
         ("paddleocr", "PaddleOCR"),
         ("ultralytics", "YOLO"),
+        ("fastapi", "FastAPI"),
+        ("uvicorn", "uvicorn"),
+        ("psutil", "psutil"),
     ]:
         proc = run([str(venv_py), "-c", f"import {mod}; print({mod}.__version__ if hasattr({mod}, '__version__') else 'ok')"])
         if proc.returncode == 0:

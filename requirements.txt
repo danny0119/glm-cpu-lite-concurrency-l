@@ -9,3 +9,6 @@ opencv-python
 paddlepaddle>=2.6,<3
 paddleocr>=2.8
 ultralytics>=8.0
+fastapi>=0.100
+uvicorn>=0.22
+psutil>=5.9
