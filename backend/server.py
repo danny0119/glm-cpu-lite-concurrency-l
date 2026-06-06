@@ -4,6 +4,7 @@
 - 共享内存零拷贝传递切片，消灭序列化开销
 """
 import os
+import sys
 import io
 import base64
 import time
@@ -20,7 +21,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-ROOT = Path(__file__).resolve().parent.parent
+if getattr(sys, 'frozen', False):
+    ROOT = Path(sys._MEIPASS)
+else:
+    ROOT = Path(__file__).resolve().parent.parent
 # 确保 backend 包在 sys.path 中
 if str(ROOT) not in os.sys.path:
     os.sys.path.insert(0, str(ROOT))
@@ -149,7 +153,11 @@ async def handle_direct_url(data: CaptchaUrlRequest):
     """接收图片 URL，下载后识别"""
     global request_counter, round_robin_idx
     chars = "".join(ch for ch in data.text if "\u4e00" <= ch <= "\u9fff")[-3:]
-    if not chars or not data.url:
+    if not chars or not data.text:
+        print(f"[400] text='{data.text[:80]}' → no Chinese chars", flush=True)
+        raise HTTPException(status_code=400, detail="missing text or url")
+    if not data.url:
+        print(f"[400] url='{data.url[:120]}' → empty url", flush=True)
         raise HTTPException(status_code=400, detail="missing text or url")
 
     loop = asyncio.get_event_loop()
@@ -157,6 +165,7 @@ async def handle_direct_url(data: CaptchaUrlRequest):
         resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(data.url, timeout=15))
         img_bytes = resp.read()
     except Exception as e:
+        print(f"[400] download failed: url='{data.url[:120]}' error={e}", flush=True)
         raise HTTPException(status_code=400, detail=f"failed to download image: {e}")
 
     if not img_bytes:
@@ -255,6 +264,10 @@ async def handle_batch_direct(data: BatchCaptchaRequest):
     return {"success": True, "count": len(final_results), "results": final_results}
 
 
-if __name__ == "__main__":
+def main():
     mp.freeze_support()
-    uvicorn.run("server:app", host="0.0.0.0", port=8888, log_level="info")
+    uvicorn.run("backend.server:app", host="0.0.0.0", port=8888, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

@@ -526,6 +526,10 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
         AUTO_CAPTCHA_CLICK : true,
         AUTO_CAPTCHA_CONFIRM: false,
         TEST_MODE: false,
+        RUSH_ENABLED        : false,
+        RUSH_TARGET_HOUR    : 9,
+        RUSH_TARGET_MIN     : 59,
+        RUSH_TARGET_SEC     : 58,
         MT_TABS          : 1,       // 多开标签页数（1=单窗口）
         MT_STAGGER_MS    : 500,     // 多开错开间隔（毫秒）
     };
@@ -895,13 +899,15 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
         const dlg = getPayDialog();
         if (!dlg) return 'keep';
 
-        // 绝对安全锁：本次会话中只要成功过一次，且DOM中有价格，永不关闭
-        if (everSucceeded) {
-            const prices = readDialogPrices();
-            if (prices && prices.any) return 'keep';
-            // 成功过但DOM无价格 → 无效支付（二维码缺参数），关闭
-            console.log('[GLM] everSucceeded but no prices in DOM, treating as invalid payment');
-            return 'close';
+        // 抢购模式锁定：抢购确认后永不自动关闭支付弹窗，留給用户手动处理
+        if (window.__glmRushConfirmed) {
+            window.__glmRushDialogSeen = 1;
+            return 'keep';
+        }
+
+        // 绝对安全锁：本次会话中只要成功过一次，且当前 bizId 有效（当前预览成功了），永不关闭
+        if (everSucceeded && PS.bizId) {
+            return 'keep';
         }
 
         // 接口还没返回
@@ -1071,6 +1077,21 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
                     <span style="font-size:14px;color:#555">启用测试模式</span>
                     <span title="开启后在页面右下角显示测试面板，可测试后端连接、验证码识别和点击确认。&#10;测试时不会触发抢购逻辑。" style="margin-left:6px;cursor:help;color:#999;font-size:14px;border:1px solid #ccc;border-radius:50%;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;line-height:1">?</span>
                 </label>
+                <div style="margin-top:8px;padding-top:12px;border-top:1px dashed #eee">
+                    <label style="display:flex;align-items:center;cursor:pointer">
+                        <input type="checkbox" id="glm-re" ${CFG.RUSH_ENABLED ? 'checked' : ''} style="margin-right:8px">
+                        <span style="font-size:14px;color:#555">启用抢购模式（验证码卡点确认）</span>
+                        <span title="开启后：第一轮验证码解完后不立即点确定，等到目标时间才提交。&#10;抢购时间过后恢复正常自动确认。" style="margin-left:6px;cursor:help;color:#999;font-size:14px;border:1px solid #ccc;border-radius:50%;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;line-height:1">?</span>
+                    </label>
+                    <div style="display:flex;align-items:center;gap:8px;margin:6px 0 0 24px">
+                        <span style="font-size:13px;color:#888">目标时间：</span>
+                        <input type="number" id="glm-rh" value="${CFG.RUSH_TARGET_HOUR}" min="0" max="23" style="width:52px;padding:3px 6px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;text-align:center">
+                        <span style="font-size:14px;color:#888">:</span>
+                        <input type="number" id="glm-rm" value="${CFG.RUSH_TARGET_MIN}" min="0" max="59" style="width:52px;padding:3px 6px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;text-align:center">
+                        <span style="font-size:14px;color:#888">:</span>
+                        <input type="number" id="glm-rs" value="${CFG.RUSH_TARGET_SEC}" min="0" max="59" style="width:52px;padding:3px 6px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;text-align:center">
+                    </div>
+                </div>
             </div>
             <div style="display:flex;justify-content:space-between;gap:10px">
                 <button id="glm-multi" style="padding:8px 16px;border:1px solid #52c41a;background:#f6ffed;color:#52c41a;border-radius:6px;cursor:pointer;font-weight:600">🚀 一键多开</button>
@@ -1098,6 +1119,10 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
                 AUTO_CAPTCHA_CLICK: panel.querySelector('#glm-acc').checked,
                 AUTO_CAPTCHA_CONFIRM: panel.querySelector('#glm-acf').checked,
                 TEST_MODE: panel.querySelector('#glm-tm').checked,
+                RUSH_ENABLED: panel.querySelector('#glm-re').checked,
+                RUSH_TARGET_HOUR: parseInt(panel.querySelector('#glm-rh').value) || 9,
+                RUSH_TARGET_MIN: parseInt(panel.querySelector('#glm-rm').value) || 59,
+                RUSH_TARGET_SEC: parseInt(panel.querySelector('#glm-rs').value) || 58,
                 SAFE_DEFAULTS_VERSION,
             });
             ov.remove(); alert('已保存，即将刷新。'); location.reload();
@@ -1169,6 +1194,13 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
             }
         }
         popupFirstSeen = 0;
+
+        // 抢购确认后：支付弹窗曾经出现过且现在已消失 → 清除锁定，恢复正常流程
+        if (window.__glmRushConfirmed && window.__glmRushDialogSeen) {
+            window.__glmRushConfirmed = 0;
+            window.__glmRushDialogSeen = 0;
+            console.log('[GLM] rush payment dialog closed by user, resuming normal flow');
+        }
 
         // 特惠订阅兜底检测（任一时间发现特惠订阅按钮就进入 TASK_UNIT）
         if (state === 'SCANNING') {
@@ -1615,6 +1647,51 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
     if (window.__glmCaptchaPromptBridge === 1) return;
     window.__glmCaptchaPromptBridge = 1;
 
+    const RUSH_CFG = (() => {
+        try {
+            const raw = GM_getValue('glm_coding_config_v5', '{}');
+            const cfg = JSON.parse(raw || '{}');
+            return {
+                enabled: cfg.RUSH_ENABLED === true,
+                targetHour: parseInt(cfg.RUSH_TARGET_HOUR) || 9,
+                targetMin: parseInt(cfg.RUSH_TARGET_MIN) || 59,
+                targetSec: parseInt(cfg.RUSH_TARGET_SEC) || 58,
+                staggerMs: 2000,
+            };
+        } catch {
+            return { enabled: false, targetHour: 9, targetMin: 59, targetSec: 58, staggerMs: 2000 };
+        }
+    })();
+
+    function getWindowIndex() {
+        try {
+            const params = new URLSearchParams(location.search);
+            return parseInt(params.get('wi') || '0', 10);
+        } catch { return 0; }
+    }
+
+    function getTargetTimestamp() {
+        const now = new Date();
+        const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
+            RUSH_CFG.targetHour, RUSH_CFG.targetMin, RUSH_CFG.targetSec, 0);
+        const offset = getWindowIndex() * RUSH_CFG.staggerMs;
+        return target.getTime() + offset;
+    }
+
+    function waitForTargetTime() {
+        return new Promise(resolve => {
+            const targetTs = getTargetTimestamp();
+            const remaining = targetTs - Date.now();
+            if (remaining <= 0) { resolve(); return; }
+            console.log('[captcha-rush] wait ' + (remaining/1000).toFixed(1) + 's for target time...');
+            function check() {
+                if (Date.now() >= targetTs) resolve();
+                else setTimeout(check, 50);
+            }
+            setTimeout(check, Math.max(0, remaining - 5000));
+        });
+    }
+
     const CAPTCHA_CFG = (() => {
         try {
             const raw = GM_getValue('glm_coding_config_v5', '{}');
@@ -1623,8 +1700,6 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
             return { AUTO_CAPTCHA_CLICK: true, AUTO_CAPTCHA_CONFIRM: false };
         }
     })();
-
-
 
     let lastCaptchaText = '';
     let captchaSent = false;
@@ -1685,6 +1760,7 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
                 return true;
             }
         }
+        return false;
     }
 
     function getCaptchaPromptText(el) {
@@ -2057,6 +2133,23 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
                 dispatchClickAt(bgEl, nx * rect.width, ny * rect.height, c.char || String(i + 1));
                 await new Promise(function(r) { setTimeout(r, 100); });
             }
+            // 抢购模式：目标时间前不点确定，到点才提交
+            if (RUSH_CFG.enabled) {
+                var targetTs = getTargetTimestamp();
+                if (Date.now() < targetTs) {
+                    console.log('[captcha-rush] rush active, waiting ' + ((targetTs - Date.now())/1000).toFixed(1) + 's until target...');
+                    rushState = 'idle';
+                    await waitForTargetTime();
+                    console.log('[captcha-rush] target time reached, confirming...');
+                    var clicked = findAndClickConfirm();
+                    console.log('[captcha-rush] confirm ' + (clicked ? 'success' : 'no button found'));
+                    if (clicked) {
+                        window.__glmRushConfirmed = Date.now();
+                    }
+                    return;
+                }
+            }
+
             await new Promise(function(r) { setTimeout(r, 150); });
             if (autoConfirm) {
                 findAndClickConfirm();
@@ -2098,6 +2191,10 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
     }
 
     setInterval(checkCaptchaPrompt, 200);
+
+    if (RUSH_CFG.enabled) {
+        console.log('[captcha] rush mode enabled, target=' + String(RUSH_CFG.targetHour).padStart(2,'0') + ':' + String(RUSH_CFG.targetMin).padStart(2,'0') + ':' + String(RUSH_CFG.targetSec).padStart(2,'0') + ' stagger=' + RUSH_CFG.staggerMs + 'ms wi=' + getWindowIndex());
+    }
 
     // ── 测试模式 ──────────────────────────────────────────────────────────────
     if (CFG.TEST_MODE) {

@@ -1,71 +1,62 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-echo === GLM Coding Helper Lite ===
+echo ============================================
+echo   GLM Coding Helper Lite - Fast Start
+echo ============================================
 echo.
 
-REM ---- 1. Config check ------------------------------------------------
-if exist "config.json" (
-    echo [OK] 配置文件已存在
+REM --- Auto-create minimal config if missing ---
+if not exist "config.json" (
+    echo [INFO] Creating default config.json...
+    >config.json echo {"workers": 4, "port": 8888, "ocr_workers": 4, "yolo_imgsz": 448, "stagger_delay": 0.5, "pipeline_depth": 3}
+)
+
+REM --- Prefer venv Python ---
+if exist "venv\Scripts\python.exe" (
+    set PYTHON=venv\Scripts\python.exe
 ) else (
-    echo [INFO] 首次运行，启动配置向导...
-    echo.
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0config.ps1" -Auto
-    if %errorlevel% neq 0 ( pause & exit /b )
-)
-echo.
-
-REM ---- 2. 优先使用自包含 EXE -----------------------------------------
-if exist "%~dp0dist\GLM-Lite\GLM-Lite.exe" (
-    echo [MODE] 自包含 EXE 模式
-    echo.
-    echo 启动后端服务...
-    echo   运行于 http://localhost:8888
-    echo.
-    echo 关闭本窗口或 Ctrl+C 停止
-    echo.
-    start "GLM-Lite Backend" /B "%~dp0dist\GLM-Lite\GLM-Lite.exe"
-    goto :wait_and_done
-)
-
-REM ---- 3. 回退：使用 venv Python 直接运行 -----------------------------
-if exist "%~dp0venv\Scripts\python.exe" (
-    echo [MODE] Python venv 模式
-    echo.
-    echo 启动后端服务（首次可能需等待模型加载）...
-    echo   运行于 http://localhost:8888
-    echo.
-    echo 关闭本窗口或 Ctrl+C 停止
-    echo.
-
-    REM 检查端口是否被占用
-    netstat -ano | findstr ":8888 " | findstr LISTENING >nul 2>&1
-    if not errorlevel 1 (
-        echo [FAIL] 端口 8888 已被占用！
-        echo     可能是因为已经运行过一个后端实例。
-        echo     请先关闭已有的命令行窗口，再重新启动。
-        echo.
+    where python >nul 2>&1
+    if errorlevel 1 (
+        echo [FAIL] Python not found. Install Python 3.10+ first.
         pause
         exit /b 1
     )
-
-    "%~dp0venv\Scripts\python.exe" "%~dp0backend\server.py"
-    pause
-    exit /b 0
+    set PYTHON=python
 )
 
-REM ---- 4. 环境不完整 ---------------------------------------------------
-echo [FAIL] 未找到 self-contained EXE 也未找到 venv 环境!
-echo.
-echo 请先运行 setup.bat 安装依赖后再试。
-echo.
-pause
-exit /b 1
+REM --- Check that backend/server.py exists ---
+if not exist "backend\server.py" (
+    echo [FAIL] backend\server.py not found. Are you in the correct directory?
+    pause
+    exit /b 1
+)
 
-:wait_and_done
-timeout /t 5 /nobreak >nul
+REM --- Check port ---
+:check_port
+netstat -ano | findstr ":8888 " | findstr LISTENING >nul 2>&1
+if not errorlevel 1 (
+    echo [WARN] Port 8888 is already in use!
+    echo       1 - Kill all Python processes and retry
+    echo       2 - Exit
+    set /p "PORT_CHOICE=Choose (1/2): "
+    if "!PORT_CHOICE!"=="1" (
+        echo [INFO] Killing all Python processes...
+        taskkill /F /IM python.exe >nul 2>&1
+        timeout /t 3 /nobreak >nul
+        goto check_port
+    )
+    exit /b 1
+)
+
+echo [OK] Starting backend service...
+echo [OK] Server at http://localhost:8888
+echo [OK] Press Ctrl+C to stop
 echo.
-echo 后端已启动。访问 http://localhost:8888/docs 查看 API 文档
+
+"%PYTHON%" backend\server.py
+
 echo.
 pause

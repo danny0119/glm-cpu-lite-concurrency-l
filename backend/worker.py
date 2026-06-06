@@ -4,6 +4,7 @@ YOLO Worker - 极致流水线版
 - 裁剪切片通过 queue 直接传递，无共享内存
 """
 import os
+import sys
 import io
 import time
 from pathlib import Path
@@ -12,7 +13,10 @@ import psutil
 from PIL import Image
 from ultralytics import YOLO
 
-ROOT = Path(__file__).resolve().parent.parent
+if getattr(sys, 'frozen', False):
+    ROOT = Path(sys._MEIPASS)
+else:
+    ROOT = Path(__file__).resolve().parent.parent
 DETECTOR = ROOT / "models" / "weights" / "yolo-captcha-detector.pt"
 YOLO_IMGSZ = 448
 
