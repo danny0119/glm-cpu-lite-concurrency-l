@@ -225,6 +225,50 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
             return visible(note);
         }
 
+        function findBgElement() {
+            const selectors = [
+                '.tencent-captcha-dy__bg-img',
+                '.tencent-captcha-dy__image',
+                '.captcha-dy__bg',
+                '.captcha-dy__image',
+                'img[class*="captcha"][src*="gtimg"]',
+                '#slideBg',
+                '[class*="captcha-bg"]',
+                'canvas[class*="captcha"]',
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el && visible(el)) return el;
+            }
+            return null;
+        }
+
+        function findPromptText() {
+            const bg = findBgElement();
+            if (bg) {
+                const label = (bg.getAttribute('aria-label') || '').trim();
+                if (label) {
+                    const chars = label.replace(/^请依次点击[：:]?\s*/, '').match(/[\u4e00-\u9fff]/g);
+                    if (chars && chars.length >= 3) return chars;
+                }
+            }
+            const textSelectors = [
+                '.tencent-captcha-dy__title',
+                '.captcha_verify_bar--text',
+                '.captcha_verify_bar',
+                '[class*="captcha"] [class*="title"]',
+                '#tcaptcha_title_text',
+            ];
+            for (const sel of textSelectors) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                const text = (el.textContent || el.getAttribute('aria-label') || '').trim();
+                const chars = text.replace(/^请依次点击[：:]?\s*/, '').match(/[\u4e00-\u9fff]/g);
+                if (chars && chars.length >= 3) return chars;
+            }
+            return [];
+        }
+
         async function solveOnce() {
             var autoClick = captchaCfg.AUTO_CAPTCHA_CLICK;
             var autoConfirm = captchaCfg.AUTO_CAPTCHA_CONFIRM;
@@ -2100,7 +2144,7 @@ function fetchCaptchaImageDirect(url) { return fetchImageDataUrl(url); }
     setInterval(checkCaptchaPrompt, 200);
 
     // ── 测试模式 ──────────────────────────────────────────────────────────────
-    if (CFG.TEST_MODE) {
+    if (typeof CFG !== 'undefined' && CFG.TEST_MODE) {
         (function() {
             var _tp = null, _tpTimer = null;
             function tpCSS() {
